@@ -10,7 +10,7 @@ from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, QH
                            QListWidget, QListWidgetItem, QPushButton, QFileDialog, QLabel,
                            QCheckBox, QMessageBox, QProgressBar, QComboBox, QGroupBox,
                            QLineEdit, QSplitter, QFrame, QTextEdit, QTableWidget, QTableWidgetItem, QHeaderView,
-                           QStyledItemDelegate)
+                           QStyledItemDelegate, QTabWidget, QRadioButton, QButtonGroup, QSizePolicy)
 from PyQt6.QtCore import Qt, QMimeData, QUrl, QThread, pyqtSignal, QTimer
 from PyQt6.QtGui import QDrag, QDropEvent, QIcon, QFont, QColor, QTextDocument, QAbstractTextDocumentLayout, QPainter, QPixmap
 
@@ -453,6 +453,89 @@ class MatchWorker(QThread):
         except Exception as e:
             self.error.emit(str(e))
 
+class RenameWorker(QThread):
+    """批量重命名工作线程"""
+    progress = pyqtSignal(int, int)
+    result_ready = pyqtSignal(list, int)
+    error = pyqtSignal(str)
+    file_count_ready = pyqtSignal(int)
+    
+    def __init__(self, directory, rename_type, prefix="", suffix="", 
+                 delete_text="", replace_from="", replace_to="", 
+                 start_number=1, number_format="{:03d}"):
+        super().__init__()
+        self.directory = directory
+        self.rename_type = rename_type
+        self.prefix = prefix
+        self.suffix = suffix
+        self.delete_text = delete_text
+        self.replace_from = replace_from
+        self.replace_to = replace_to
+        self.start_number = start_number
+        self.number_format = number_format
+        self._is_cancelled = False
+    
+    def cancel(self):
+        """取消重命名操作"""
+        self._is_cancelled = True
+    
+    def run(self):
+        try:
+            # 获取目录中的所有文件
+            if not self.directory or not os.path.isdir(self.directory):
+                self.error.emit("请选择有效的目录")
+                return
+            
+            files = [f for f in os.listdir(self.directory) if os.path.isfile(os.path.join(self.directory, f))]
+            
+            # 发送文件数量信号
+            self.file_count_ready.emit(len(files))
+            
+            if not files:
+                self.error.emit("目录中没有文件")
+                return
+            
+            # 检查是否已取消
+            if self._is_cancelled:
+                return
+            
+            # 预览重命名结果
+            results = []
+            for i, filename in enumerate(files):
+                if self._is_cancelled:
+                    return
+                
+                name, ext = os.path.splitext(filename)
+                new_name = name
+                
+                # 根据不同的重命名类型处理
+                if self.rename_type == 0:  # 添加前缀
+                    new_name = self.prefix + name
+                elif self.rename_type == 1:  # 添加后缀
+                    new_name = name + self.suffix
+                elif self.rename_type == 2:  # 删除指定字段
+                    if self.delete_text:
+                        new_name = name.replace(self.delete_text, "")
+                elif self.rename_type == 3:  # 替换指定字段
+                    if self.replace_from:
+                        new_name = name.replace(self.replace_from, self.replace_to)
+                elif self.rename_type == 4:  # 按升序编号
+                    number = self.start_number + i
+                    formatted_number = self.number_format.format(number)
+                    new_name = formatted_number + "_" + name
+                
+                new_filename = new_name + ext
+                results.append((filename, new_filename))
+                
+                # 更新进度
+                self.progress.emit(i + 1, len(files))
+            
+            # 发送结果
+            self.result_ready.emit(results, len(results))
+            
+        except Exception as e:
+            self.error.emit(str(e))
+
 class FileSelector(QMainWindow):
     def __init__(self):
         super().__init__()
@@ -460,20 +543,30 @@ class FileSelector(QMainWindow):
         self.source_dir = ""
         self.target_dir = ""
         self.output_dir = ""
+        self.rename_dir = ""  # 新增重命名目录
         self.matched_files = []
         self._search_anim_timer = None
         self._search_anim_step = 0
         self.processing = False
+        self.rename_results = []  # 存储重命名结果
+        self.rename_history = []  # 存储重命名历史，用于撤回功能
         
         # 设置应用图标
         self.setWindowIcon(create_app_icon())
 
     def init_ui(self):
-        self.setWindowTitle("文件筛选工具")
+        self.setWindowTitle("文件处理工具 v2.0        *使用遇到bug或有功能建议请及时联系王永皓")
         self.setGeometry(300, 300, 1000, 800)
         central_widget = QWidget()
         self.setCentralWidget(central_widget)
         main_layout = QVBoxLayout(central_widget)
+        
+        # 创建选项卡控件
+        self.tab_widget = QTabWidget()
+        
+        # 批量文件提取选项卡
+        file_selector_tab = QWidget()
+        file_selector_layout = QVBoxLayout(file_selector_tab)
         
         # 进度条和取消按钮的水平布局
         progress_layout = QHBoxLayout()
@@ -489,7 +582,7 @@ class FileSelector(QMainWindow):
         self.cancel_btn.setVisible(False)
         progress_layout.addWidget(self.cancel_btn)
         
-        main_layout.addLayout(progress_layout)
+        file_selector_layout.addLayout(progress_layout)
         
         splitter = QSplitter(Qt.Orientation.Horizontal)
         # 左侧设置面板
@@ -505,7 +598,7 @@ class FileSelector(QMainWindow):
         source_layout.addWidget(QLabel("源目录:"))
         self.source_label = QLabel("未选择")
         self.source_label.setFrameStyle(QFrame.Shape.StyledPanel | QFrame.Shadow.Sunken)
-        self.source_label.setFixedWidth(300)
+        self.source_label.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
         self.source_label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse | Qt.TextInteractionFlag.TextBrowserInteraction)
         self.source_label.setWordWrap(False)
         self.source_label.setToolTip("未选择")
@@ -514,40 +607,44 @@ class FileSelector(QMainWindow):
         self.source_label.dropEvent = lambda event: self.drop_event(event, "source")
         source_btn = QPushButton("浏览...")
         source_btn.clicked.connect(lambda: self.select_directory("source"))
-        source_layout.addWidget(self.source_label)
-        source_layout.addWidget(source_btn)
+        source_layout.addWidget(self.source_label, 1)
+        source_layout.addWidget(source_btn, 0)
         # 目标目录选择
         target_layout = QHBoxLayout()
         target_layout.addWidget(QLabel("目标目录:"))
         self.target_label = QLabel("未选择")
         self.target_label.setFrameStyle(QFrame.Shape.StyledPanel | QFrame.Shadow.Sunken)
-        self.target_label.setFixedWidth(300)
+        self.target_label.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
         self.target_label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse | Qt.TextInteractionFlag.TextBrowserInteraction)
         self.target_label.setWordWrap(False)
         self.target_label.setToolTip("未选择")
         self.target_label.setAcceptDrops(True)
         self.target_label.dragEnterEvent = self.drag_enter_event
-        self.target_label.dropEvent = lambda event: self.drop_event(event, "target")
+        def drop_event_target(event):
+            self.drop_event(event, "target")
+        self.target_label.dropEvent = drop_event_target
         target_btn = QPushButton("浏览...")
         target_btn.clicked.connect(lambda: self.select_directory("target"))
-        target_layout.addWidget(self.target_label)
-        target_layout.addWidget(target_btn)
+        target_layout.addWidget(self.target_label, 1)
+        target_layout.addWidget(target_btn, 0)
         # 输出目录选择
         output_layout = QHBoxLayout()
         output_layout.addWidget(QLabel("输出目录:"))
         self.output_label = QLabel("未选择")
         self.output_label.setFrameStyle(QFrame.Shape.StyledPanel | QFrame.Shadow.Sunken)
-        self.output_label.setFixedWidth(300)
+        self.output_label.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
         self.output_label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse | Qt.TextInteractionFlag.TextBrowserInteraction)
         self.output_label.setWordWrap(False)
         self.output_label.setToolTip("未选择")
         self.output_label.setAcceptDrops(True)
         self.output_label.dragEnterEvent = self.drag_enter_event
-        self.output_label.dropEvent = lambda event: self.drop_event(event, "output")
+        def drop_event_output(event):
+            self.drop_event(event, "output")
+        self.output_label.dropEvent = drop_event_output
         output_btn = QPushButton("浏览...")
         output_btn.clicked.connect(lambda: self.select_directory("output"))
-        output_layout.addWidget(self.output_label)
-        output_layout.addWidget(output_btn)
+        output_layout.addWidget(self.output_label, 1)
+        output_layout.addWidget(output_btn, 0)
         dir_layout.addLayout(source_layout)
         dir_layout.addLayout(target_layout)
         dir_layout.addLayout(output_layout)
@@ -678,9 +775,560 @@ class FileSelector(QMainWindow):
         right_layout.addWidget(self.result_table)
         splitter.addWidget(right_panel)
         splitter.setSizes([350, 850])
-        main_layout.addWidget(splitter)
+        file_selector_layout.addWidget(splitter)
+        
+        # 批量重命名选项卡
+        rename_tab = QWidget()
+        rename_layout = QVBoxLayout(rename_tab)
+        
+        # 重命名目录选择
+        rename_dir_group = QGroupBox("目录设置")
+        rename_dir_layout = QVBoxLayout()
+        
+        rename_dir_row = QHBoxLayout()
+        rename_dir_row.addWidget(QLabel("重命名目录:"))
+        self.rename_dir_label = QLabel("未选择")
+        self.rename_dir_label.setFrameStyle(QFrame.Shape.StyledPanel | QFrame.Shadow.Sunken)
+        self.rename_dir_label.setFixedWidth(300)
+        self.rename_dir_label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse | Qt.TextInteractionFlag.TextBrowserInteraction)
+        self.rename_dir_label.setWordWrap(False)
+        self.rename_dir_label.setToolTip("未选择")
+        self.rename_dir_label.setAcceptDrops(True)
+        self.rename_dir_label.dragEnterEvent = self.drag_enter_event
+        self.rename_dir_label.dropEvent = lambda event: self.drop_event(event, "rename")
+        
+        rename_dir_btn = QPushButton("浏览...")
+        rename_dir_btn.clicked.connect(lambda: self.select_directory("rename"))
+        
+        rename_dir_row.addWidget(self.rename_dir_label)
+        rename_dir_row.addWidget(rename_dir_btn)
+        rename_dir_layout.addLayout(rename_dir_row)
+        
+        # 显示文件数量
+        self.rename_file_count_label = QLabel("目录文件数: 0")
+        rename_dir_layout.addWidget(self.rename_file_count_label)
+        
+        rename_dir_group.setLayout(rename_dir_layout)
+        rename_layout.addWidget(rename_dir_group)
+        
+        # 重命名设置
+        rename_settings_group = QGroupBox("重命名设置")
+        rename_settings_layout = QVBoxLayout()
+        
+        # 重命名类型选择
+        rename_type_layout = QVBoxLayout()
+        rename_type_layout.addWidget(QLabel("重命名类型:"))
+        
+        # 使用单选按钮组
+        self.rename_type_group = QButtonGroup(self)
+        
+        # 添加前缀选项
+        prefix_radio = QRadioButton("添加前缀")
+        prefix_radio.setChecked(True)  # 默认选中
+        self.rename_type_group.addButton(prefix_radio, 0)
+        rename_type_layout.addWidget(prefix_radio)
+        
+        self.prefix_input = QLineEdit()
+        self.prefix_input.setPlaceholderText("请输入前缀")
+        rename_type_layout.addWidget(self.prefix_input)
+        
+        # 添加后缀选项
+        suffix_radio = QRadioButton("添加后缀")
+        self.rename_type_group.addButton(suffix_radio, 1)
+        rename_type_layout.addWidget(suffix_radio)
+        
+        self.suffix_input = QLineEdit()
+        self.suffix_input.setPlaceholderText("请输入后缀")
+        self.suffix_input.setEnabled(False)
+        rename_type_layout.addWidget(self.suffix_input)
+        
+        # 删除指定字段选项
+        delete_radio = QRadioButton("删除指定字段")
+        self.rename_type_group.addButton(delete_radio, 2)
+        rename_type_layout.addWidget(delete_radio)
+        
+        self.delete_input = QLineEdit()
+        self.delete_input.setPlaceholderText("请输入要删除的字段")
+        self.delete_input.setEnabled(False)
+        rename_type_layout.addWidget(self.delete_input)
+        
+        # 替换指定字段选项
+        replace_radio = QRadioButton("替换指定字段")
+        self.rename_type_group.addButton(replace_radio, 3)
+        rename_type_layout.addWidget(replace_radio)
+        
+        replace_layout = QHBoxLayout()
+        self.replace_from_input = QLineEdit()
+        self.replace_from_input.setPlaceholderText("原字段")
+        self.replace_from_input.setEnabled(False)
+        replace_layout.addWidget(self.replace_from_input)
+        
+        replace_layout.addWidget(QLabel("→"))
+        
+        self.replace_to_input = QLineEdit()
+        self.replace_to_input.setPlaceholderText("新字段")
+        self.replace_to_input.setEnabled(False)
+        replace_layout.addWidget(self.replace_to_input)
+        rename_type_layout.addLayout(replace_layout)
+        
+        # 按升序编号选项
+        number_radio = QRadioButton("按升序编号")
+        self.rename_type_group.addButton(number_radio, 4)
+        rename_type_layout.addWidget(number_radio)
+        
+        number_layout = QHBoxLayout()
+        number_layout.addWidget(QLabel("起始编号:"))
+        self.start_number_input = QLineEdit("1")
+        self.start_number_input.setEnabled(False)
+        number_layout.addWidget(self.start_number_input)
+        
+        number_layout.addWidget(QLabel("格式:"))
+        self.number_format_combo = QComboBox()
+        self.number_format_combo.addItems(["001", "01", "1"])
+        self.number_format_combo.setEnabled(False)
+        number_layout.addWidget(self.number_format_combo)
+        rename_type_layout.addLayout(number_layout)
+        
+        # 连接单选按钮信号
+        self.rename_type_group.buttonClicked.connect(self.on_rename_type_changed)
+        
+        rename_settings_layout.addLayout(rename_type_layout)
+        rename_settings_group.setLayout(rename_settings_layout)
+        rename_layout.addWidget(rename_settings_group)
+        
+        # 预览和执行按钮
+        rename_buttons_layout = QHBoxLayout()
+        self.preview_rename_btn = QPushButton("预览重命名")
+        self.preview_rename_btn.clicked.connect(self.preview_rename)
+        rename_buttons_layout.addWidget(self.preview_rename_btn)
+        
+        self.execute_rename_btn = QPushButton("执行重命名")
+        self.execute_rename_btn.clicked.connect(self.execute_rename)
+        self.execute_rename_btn.setEnabled(False)
+        rename_buttons_layout.addWidget(self.execute_rename_btn)
+        
+        self.undo_rename_btn = QPushButton("撤回重命名")
+        self.undo_rename_btn.clicked.connect(self.undo_rename)
+        self.undo_rename_btn.setEnabled(False)
+        rename_buttons_layout.addWidget(self.undo_rename_btn)
+        
+        rename_layout.addLayout(rename_buttons_layout)
+        
+        # 重命名状态标签
+        self.rename_status_label = QLabel("准备就绪")
+        rename_layout.addWidget(self.rename_status_label)
+        
+        # 重命名预览表格
+        self.rename_preview_table = QTableWidget()
+        self.rename_preview_table.setColumnCount(2)
+        self.rename_preview_table.setHorizontalHeaderLabels(["原文件名", "新文件名"])
+        self.rename_preview_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
+        self.rename_preview_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
+        rename_layout.addWidget(self.rename_preview_table)
+        
+        # 添加选项卡
+        self.tab_widget.addTab(file_selector_tab, "批量文件提取")
+        self.tab_widget.addTab(rename_tab, "批量重命名")
+        
+        main_layout.addWidget(self.tab_widget)
         self.setAcceptDrops(True)
         self.on_match_method_changed(0)
+
+    def on_rename_type_changed(self, button):
+        """当重命名类型改变时更新UI"""
+        # 禁用所有输入框
+        self.prefix_input.setEnabled(False)
+        self.suffix_input.setEnabled(False)
+        self.delete_input.setEnabled(False)
+        self.replace_from_input.setEnabled(False)
+        self.replace_to_input.setEnabled(False)
+        self.start_number_input.setEnabled(False)
+        self.number_format_combo.setEnabled(False)
+        
+        # 根据选择的类型启用相应的输入框
+        type_id = self.rename_type_group.id(button)
+        if type_id == 0:  # 添加前缀
+            self.prefix_input.setEnabled(True)
+        elif type_id == 1:  # 添加后缀
+            self.suffix_input.setEnabled(True)
+        elif type_id == 2:  # 删除指定字段
+            self.delete_input.setEnabled(True)
+        elif type_id == 3:  # 替换指定字段
+            self.replace_from_input.setEnabled(True)
+            self.replace_to_input.setEnabled(True)
+        elif type_id == 4:  # 按升序编号
+            self.start_number_input.setEnabled(True)
+            self.number_format_combo.setEnabled(True)
+
+    def drag_enter_event(self, event):
+        if event.mimeData().hasUrls():
+            event.acceptProposedAction()
+
+    def drop_event(self, event, target_type):
+        if event.mimeData().hasUrls():
+            url = event.mimeData().urls()[0]
+            file_path = url.toLocalFile()
+            
+            if os.path.isdir(file_path):
+                if target_type == "source":
+                    self.source_dir = file_path
+                    self.source_label.setText(file_path)
+                    self.source_label.setToolTip(file_path)
+                elif target_type == "target":
+                    self.target_dir = file_path
+                    self.target_label.setText(file_path)
+                    self.target_label.setToolTip(file_path)
+                elif target_type == "output":
+                    self.output_dir = file_path
+                    self.output_label.setText(file_path)
+                    self.output_label.setToolTip(file_path)
+                elif target_type == "rename":
+                    self.rename_dir = file_path
+                    self.rename_dir_label.setText(file_path)
+                    self.rename_dir_label.setToolTip(file_path)
+                    self.update_rename_file_count()
+
+    def select_directory(self, dir_type):
+        directory = QFileDialog.getExistingDirectory(self, "选择文件夹")
+        if directory:
+            if dir_type == "source":
+                self.source_dir = directory
+                self.source_label.setText(directory)
+                self.source_label.setToolTip(directory)
+            elif dir_type == "target":
+                self.target_dir = directory
+                self.target_label.setText(directory)
+                self.target_label.setToolTip(directory)
+            elif dir_type == "output":
+                self.output_dir = directory
+                self.output_label.setText(directory)
+                self.output_label.setToolTip(directory)
+            elif dir_type == "rename":
+                self.rename_dir = directory
+                self.rename_dir_label.setText(directory)
+                self.rename_dir_label.setToolTip(directory)
+                self.update_rename_file_count()
+
+    def update_rename_file_count(self):
+        """更新重命名目录的文件数量"""
+        if not self.rename_dir or not os.path.isdir(self.rename_dir):
+            self.rename_file_count_label.setText("目录文件数: 0")
+            return
+        
+        try:
+            files = [f for f in os.listdir(self.rename_dir) if os.path.isfile(os.path.join(self.rename_dir, f))]
+            self.rename_file_count_label.setText(f"目录文件数: {len(files)}")
+        except Exception as e:
+            self.rename_file_count_label.setText(f"目录文件数: 0 (错误: {str(e)})")
+
+    def preview_rename(self):
+        """预览重命名结果"""
+        if not self.rename_dir:
+            QMessageBox.warning(self, "警告", "请先选择重命名目录")
+            return
+        
+        # 获取重命名类型和参数
+        rename_type = self.rename_type_group.checkedId()
+        
+        # 获取输入参数
+        prefix = self.prefix_input.text()
+        suffix = self.suffix_input.text()
+        delete_text = self.delete_input.text()
+        replace_from = self.replace_from_input.text()
+        replace_to = self.replace_to_input.text()
+        
+        # 获取编号参数
+        try:
+            start_number = int(self.start_number_input.text())
+        except ValueError:
+            start_number = 1
+        
+        # 获取编号格式
+        number_format_index = self.number_format_combo.currentIndex()
+        number_format = "{:03d}" if number_format_index == 0 else "{:02d}" if number_format_index == 1 else "{:d}"
+        
+        # 验证输入
+        if rename_type == 0 and not prefix:
+            QMessageBox.warning(self, "警告", "请输入前缀")
+            return
+        elif rename_type == 1 and not suffix:
+            QMessageBox.warning(self, "警告", "请输入后缀")
+            return
+        elif rename_type == 2 and not delete_text:
+            QMessageBox.warning(self, "警告", "请输入要删除的字段")
+            return
+        elif rename_type == 3 and not replace_from:
+            QMessageBox.warning(self, "警告", "请输入要替换的原字段")
+            return
+        
+        # 显示进度条和取消按钮
+        self.progress_bar.setVisible(True)
+        self.progress_bar.setValue(0)
+        self.cancel_btn.setVisible(True)
+        self.cancel_btn.setEnabled(True)
+        
+        # 禁用预览按钮
+        self.preview_rename_btn.setEnabled(False)
+        self.execute_rename_btn.setEnabled(False)
+        
+        # 创建并启动工作线程
+        self.rename_worker = RenameWorker(
+            self.rename_dir,
+            rename_type,
+            prefix,
+            suffix,
+            delete_text,
+            replace_from,
+            replace_to,
+            start_number,
+            number_format
+        )
+        
+        # 连接信号
+        self.rename_worker.progress.connect(self.on_rename_progress)
+        self.rename_worker.result_ready.connect(self.on_rename_preview_result)
+        self.rename_worker.error.connect(self.on_rename_error)
+        self.rename_worker.file_count_ready.connect(self.on_rename_file_count_ready)
+        
+        # 更新状态
+        self.rename_status_label.setText("正在生成预览...")
+        
+        # 启动工作线程
+        self.rename_worker.start()
+
+    def on_rename_progress(self, value, total):
+        """更新重命名进度"""
+        progress_percent = int(value / total * 100) if total > 0 else 0
+        self.progress_bar.setValue(progress_percent)
+
+    def on_rename_file_count_ready(self, count):
+        """更新重命名文件数量"""
+        self.rename_file_count_label.setText(f"目录文件数: {count}")
+
+    def on_rename_preview_result(self, results, count):
+        """显示重命名预览结果"""
+        # 存储结果
+        self.rename_results = results
+        
+        # 清空表格
+        self.rename_preview_table.setRowCount(0)
+        
+        # 设置表格行数
+        self.rename_preview_table.setRowCount(count)
+        
+        # 填充表格
+        for row, (old_name, new_name) in enumerate(results):
+            self.rename_preview_table.setItem(row, 0, QTableWidgetItem(old_name))
+            self.rename_preview_table.setItem(row, 1, QTableWidgetItem(new_name))
+        
+        # 更新状态
+        self.rename_status_label.setText(f"预览生成完成，共 {count} 个文件")
+        
+        # 隐藏进度条和取消按钮
+        self.progress_bar.setVisible(False)
+        self.cancel_btn.setVisible(False)
+        
+        # 启用按钮
+        self.preview_rename_btn.setEnabled(True)
+        self.execute_rename_btn.setEnabled(True)
+        
+        # 检查是否有重名文件
+        new_names = [new_name for _, new_name in results]
+        if len(new_names) != len(set(new_names)):
+            QMessageBox.warning(self, "警告", "检测到重命名后存在重复的文件名，请修改重命名规则")
+            self.execute_rename_btn.setEnabled(False)
+
+    def on_rename_error(self, msg):
+        """处理重命名错误"""
+        self.rename_status_label.setText(f"错误: {msg}")
+        
+        # 隐藏进度条和取消按钮
+        self.progress_bar.setVisible(False)
+        self.cancel_btn.setVisible(False)
+        
+        # 启用预览按钮
+        self.preview_rename_btn.setEnabled(True)
+        
+        QMessageBox.critical(self, "错误", f"重命名时出错: {msg}")
+
+    def execute_rename(self):
+        """执行重命名操作"""
+        if not self.rename_results:
+            QMessageBox.warning(self, "警告", "请先预览重命名结果")
+            return
+        
+        reply = QMessageBox.question(self, "确认操作", 
+                                     f"确定要重命名 {len(self.rename_results)} 个文件吗？",
+                                     QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
+        if reply != QMessageBox.StandardButton.Yes:
+            return
+        
+        # 显示进度条和取消按钮
+        self.progress_bar.setVisible(True)
+        self.progress_bar.setValue(0)
+        self.progress_bar.setMaximum(len(self.rename_results))
+        self.cancel_btn.setVisible(True)
+        self.cancel_btn.setEnabled(True)
+        
+        # 禁用按钮
+        self.preview_rename_btn.setEnabled(False)
+        self.execute_rename_btn.setEnabled(False)
+        
+        # 更新状态
+        self.rename_status_label.setText("正在重命名文件...")
+        
+        # 执行重命名
+        success_count = 0
+        error_count = 0
+        rename_operations = []  # 记录重命名操作，用于撤回
+        
+        try:
+            for i, (old_name, new_name) in enumerate(self.rename_results):
+                # 检查取消状态
+                QApplication.processEvents()
+                if not self.cancel_btn.isEnabled():
+                    self.rename_status_label.setText("重命名已取消")
+                    break
+                
+                try:
+                    old_path = os.path.join(self.rename_dir, old_name)
+                    new_path = os.path.join(self.rename_dir, new_name)
+                    
+                    # 检查目标文件是否已存在
+                    if os.path.exists(new_path) and old_path != new_path:
+                        # 如果目标文件已存在，使用临时文件名
+                        temp_path = new_path + ".temp"
+                        os.rename(old_path, temp_path)
+                        os.rename(temp_path, new_path)
+                    else:
+                        os.rename(old_path, new_path)
+                    
+                    # 记录重命名操作
+                    rename_operations.append((new_name, old_name))
+                    success_count += 1
+                except Exception as e:
+                    error_count += 1
+                    print(f"重命名文件 {old_name} 时出错: {str(e)}")
+                
+                # 更新进度
+                self.progress_bar.setValue(i + 1)
+                self.rename_status_label.setText(f"正在重命名文件... {i+1}/{len(self.rename_results)}")
+        
+        finally:
+            # 隐藏进度条和取消按钮
+            self.progress_bar.setVisible(False)
+            self.cancel_btn.setVisible(False)
+            
+            # 启用按钮
+            self.preview_rename_btn.setEnabled(True)
+            
+            # 更新状态
+            self.rename_status_label.setText(f"重命名完成: 成功 {success_count} 个，失败 {error_count} 个")
+            
+            # 更新文件列表
+            self.update_rename_file_count()
+            
+            # 清空结果
+            self.rename_results = []
+            
+            # 如果有成功的重命名，保存到历史记录并启用撤回按钮
+            if success_count > 0:
+                self.rename_history.append(rename_operations)
+                self.undo_rename_btn.setEnabled(True)
+                # 重新预览
+                self.preview_rename()
+            else:
+                self.execute_rename_btn.setEnabled(False)
+            
+            QMessageBox.information(self, "完成", f"重命名完成: 成功 {success_count} 个，失败 {error_count} 个")
+
+    def undo_rename(self):
+        """撤回重命名操作"""
+        if not self.rename_history:
+            QMessageBox.warning(self, "警告", "没有可撤回的重命名操作")
+            return
+        
+        reply = QMessageBox.question(self, "确认撤回", 
+                                     f"确定要撤回最近一次的重命名操作吗？",
+                                     QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
+        if reply != QMessageBox.StandardButton.Yes:
+            return
+        
+        # 获取最近一次的重命名操作
+        last_operations = self.rename_history.pop()
+        
+        # 显示进度条和取消按钮
+        self.progress_bar.setVisible(True)
+        self.progress_bar.setValue(0)
+        self.progress_bar.setMaximum(len(last_operations))
+        self.cancel_btn.setVisible(True)
+        self.cancel_btn.setEnabled(True)
+        
+        # 禁用按钮
+        self.preview_rename_btn.setEnabled(False)
+        self.execute_rename_btn.setEnabled(False)
+        self.undo_rename_btn.setEnabled(False)
+        
+        # 更新状态
+        self.rename_status_label.setText("正在撤回重命名操作...")
+        
+        # 执行撤回操作
+        success_count = 0
+        error_count = 0
+        
+        try:
+            for i, (current_name, original_name) in enumerate(last_operations):
+                # 检查取消状态
+                QApplication.processEvents()
+                if not self.cancel_btn.isEnabled():
+                    self.rename_status_label.setText("撤回操作已取消")
+                    break
+                
+                try:
+                    current_path = os.path.join(self.rename_dir, current_name)
+                    original_path = os.path.join(self.rename_dir, original_name)
+                    
+                    # 检查目标文件是否已存在
+                    if os.path.exists(original_path) and current_path != original_path:
+                        # 如果目标文件已存在，使用临时文件名
+                        temp_path = original_path + ".temp"
+                        os.rename(current_path, temp_path)
+                        os.rename(temp_path, original_path)
+                    else:
+                        os.rename(current_path, original_path)
+                    
+                    success_count += 1
+                except Exception as e:
+                    error_count += 1
+                    print(f"撤回重命名文件 {current_name} 时出错: {str(e)}")
+                
+                # 更新进度
+                self.progress_bar.setValue(i + 1)
+                self.rename_status_label.setText(f"正在撤回重命名操作... {i+1}/{len(last_operations)}")
+        
+        finally:
+            # 隐藏进度条和取消按钮
+            self.progress_bar.setVisible(False)
+            self.cancel_btn.setVisible(False)
+            
+            # 启用按钮
+            self.preview_rename_btn.setEnabled(True)
+            
+            # 如果没有更多历史记录，禁用撤回按钮
+            if not self.rename_history:
+                self.undo_rename_btn.setEnabled(False)
+            
+            # 更新状态
+            self.rename_status_label.setText(f"撤回完成: 成功 {success_count} 个，失败 {error_count} 个")
+            
+            # 更新文件列表
+            self.update_rename_file_count()
+            
+            # 如果有成功的撤回，重新预览
+            if success_count > 0:
+                self.preview_rename()
+            
+            QMessageBox.information(self, "完成", f"撤回完成: 成功 {success_count} 个，失败 {error_count} 个")
 
     def on_match_method_changed(self, index):
         # 隐藏所有设置项
@@ -715,62 +1363,6 @@ class FileSelector(QMainWindow):
                         subitem = item.layout().itemAt(j)
                         if subitem and subitem.widget():
                             subitem.widget().show()
-
-    def drag_enter_event(self, event):
-        if event.mimeData().hasUrls():
-            event.acceptProposedAction()
-
-    def drop_event(self, event, target_type):
-        if event.mimeData().hasUrls():
-            url = event.mimeData().urls()[0]
-            file_path = url.toLocalFile()
-            
-            if os.path.isdir(file_path):
-                if target_type == "source":
-                    self.source_dir = file_path
-                    self.source_label.setText(file_path)
-                    self.source_label.setToolTip(file_path)
-                elif target_type == "target":
-                    self.target_dir = file_path
-                    self.target_label.setText(file_path)
-                    self.target_label.setToolTip(file_path)
-                elif target_type == "output":
-                    self.output_dir = file_path
-                    self.output_label.setText(file_path)
-                    self.output_label.setToolTip(file_path)
-
-    def select_directory(self, dir_type):
-        directory = QFileDialog.getExistingDirectory(self, "选择文件夹")
-        if directory:
-            if dir_type == "source":
-                self.source_dir = directory
-                self.source_label.setText(directory)
-                self.source_label.setToolTip(directory)
-            elif dir_type == "target":
-                self.target_dir = directory
-                self.target_label.setText(directory)
-                self.target_label.setToolTip(directory)
-            elif dir_type == "output":
-                self.output_dir = directory
-                self.output_label.setText(directory)
-                self.output_label.setToolTip(directory)
-
-    def update_source_file_list(self):
-        """更新源文件列表"""
-        self.source_file_list.clear()
-        if not self.source_dir:
-            self.source_count_label.setText("源文件总数: 0")
-            return
-            
-        try:
-            source_files = [f for f in os.listdir(self.source_dir) if os.path.isfile(os.path.join(self.source_dir, f))]
-            for file_name in source_files:
-                item = QListWidgetItem(file_name)
-                self.source_file_list.addItem(item)
-            
-            self.source_count_label.setText(f"源文件总数: {len(source_files)}")
-        except Exception as e:
-            self.source_count_label.setText(f"源文件总数: 0 (错误: {str(e)})")
 
     def match_files(self):
         # 如果有正在运行的匹配任务，先取消它
