@@ -6,6 +6,8 @@ import sys
 import re
 import shutil
 import concurrent.futures
+import tempfile
+import pandas as pd
 from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, 
                            QListWidget, QListWidgetItem, QPushButton, QFileDialog, QLabel,
                            QCheckBox, QMessageBox, QProgressBar, QComboBox, QGroupBox,
@@ -551,11 +553,16 @@ class FileSelector(QMainWindow):
         self.rename_results = []  # 存储重命名结果
         self.rename_history = []  # 存储重命名历史，用于撤回功能
         
+        # Excel相关属性
+        self.excel_file_path = None  # Excel文件路径
+        self.excel_data = None  # Excel数据
+        self.temp_excel_dir = None  # 临时Excel文件目录
+        
         # 设置应用图标
         self.setWindowIcon(create_app_icon())
 
     def init_ui(self):
-        self.setWindowTitle("文件处理工具 v2.0        *使用遇到bug或有功能建议请及时联系王永皓")
+        self.setWindowTitle("文件处理工具 v2.1        *使用遇到bug或有功能建议请及时联系王永皓")
         self.setGeometry(300, 300, 1000, 800)
         central_widget = QWidget()
         self.setCentralWidget(central_widget)
@@ -889,6 +896,21 @@ class FileSelector(QMainWindow):
         number_layout.addWidget(self.number_format_combo)
         rename_type_layout.addLayout(number_layout)
         
+        # Excel替换命名选项
+        excel_radio = QRadioButton("Excel替换命名")
+        self.rename_type_group.addButton(excel_radio, 5)
+        rename_type_layout.addWidget(excel_radio)
+        
+        excel_layout = QHBoxLayout()
+        self.open_excel_btn = QPushButton("打开表格")
+        self.open_excel_btn.setEnabled(False)
+        self.open_excel_btn.clicked.connect(self.open_excel_file)
+        excel_layout.addWidget(self.open_excel_btn)
+        
+        self.excel_status_label = QLabel("请先选择重命名目录")
+        excel_layout.addWidget(self.excel_status_label)
+        rename_type_layout.addLayout(excel_layout)
+        
         # 连接单选按钮信号
         self.rename_type_group.buttonClicked.connect(self.on_rename_type_changed)
         
@@ -944,6 +966,7 @@ class FileSelector(QMainWindow):
         self.replace_to_input.setEnabled(False)
         self.start_number_input.setEnabled(False)
         self.number_format_combo.setEnabled(False)
+        self.open_excel_btn.setEnabled(False)
         
         # 根据选择的类型启用相应的输入框
         type_id = self.rename_type_group.id(button)
@@ -959,6 +982,16 @@ class FileSelector(QMainWindow):
         elif type_id == 4:  # 按升序编号
             self.start_number_input.setEnabled(True)
             self.number_format_combo.setEnabled(True)
+        elif type_id == 5: # Excel替换命名
+            self.open_excel_btn.setEnabled(True)
+            self.excel_status_label.setText("请先选择重命名目录")
+            # 如果已经选择了重命名目录，自动生成Excel文件
+            if self.rename_dir and os.path.isdir(self.rename_dir):
+                try:
+                    files = [f for f in os.listdir(self.rename_dir) if os.path.isfile(os.path.join(self.rename_dir, f))]
+                    self.generate_excel_file(files)
+                except Exception as e:
+                    self.excel_status_label.setText(f"生成Excel文件失败: {str(e)}")
 
     def drag_enter_event(self, event):
         if event.mimeData().hasUrls():
@@ -986,6 +1019,8 @@ class FileSelector(QMainWindow):
                     self.rename_dir = file_path
                     self.rename_dir_label.setText(file_path)
                     self.rename_dir_label.setToolTip(file_path)
+                    # 清除之前的Excel缓存
+                    self.clear_excel_cache()
                     self.update_rename_file_count()
 
     def select_directory(self, dir_type):
@@ -1007,6 +1042,8 @@ class FileSelector(QMainWindow):
                 self.rename_dir = directory
                 self.rename_dir_label.setText(directory)
                 self.rename_dir_label.setToolTip(directory)
+                # 清除之前的Excel缓存
+                self.clear_excel_cache()
                 self.update_rename_file_count()
 
     def update_rename_file_count(self):
@@ -1018,8 +1055,192 @@ class FileSelector(QMainWindow):
         try:
             files = [f for f in os.listdir(self.rename_dir) if os.path.isfile(os.path.join(self.rename_dir, f))]
             self.rename_file_count_label.setText(f"目录文件数: {len(files)}")
+            
+            # 如果选择了Excel替换命名，自动生成Excel文件
+            if self.rename_type_group.checkedId() == 5:
+                self.generate_excel_file(files)
         except Exception as e:
             self.rename_file_count_label.setText(f"目录文件数: 0 (错误: {str(e)})")
+
+    def generate_excel_file(self, files):
+        """生成Excel文件"""
+        try:
+            # 如果已经有Excel文件且存在，先检查是否可用
+            if self.excel_file_path and os.path.exists(self.excel_file_path):
+                try:
+                    # 尝试读取文件，检查是否被占用
+                    test_df = pd.read_excel(self.excel_file_path, engine='openpyxl')
+                    # 如果文件可以正常读取，检查文件数量是否匹配
+                    if not test_df.empty and len(test_df) == len(files):
+                        # 确保数据类型正确
+                        test_df['源文件名'] = test_df['源文件名'].astype(str)
+                        test_df['重命名'] = test_df['重命名'].astype(str)
+                        self.excel_status_label.setText(f"Excel文件已存在: {len(files)}个文件")
+                        self.excel_data = test_df
+                        return
+                except:
+                    # 如果文件被占用或无法读取，继续生成新文件
+                    pass
+            
+            # 创建临时目录
+            if not self.temp_excel_dir:
+                self.temp_excel_dir = tempfile.mkdtemp(prefix="rename_excel_")
+            
+            # 创建Excel文件路径
+            self.excel_file_path = os.path.join(self.temp_excel_dir, "rename_files.xlsx")
+            
+            # 创建DataFrame
+            df = pd.DataFrame({
+                '源文件名': [str(f) for f in files],
+                '重命名': [str(f) for f in files]  # 默认重命名与源文件名相同
+            })
+            
+            # 保存到Excel文件
+            df.to_excel(self.excel_file_path, index=False, engine='openpyxl')
+            
+            # 更新状态
+            self.excel_status_label.setText(f"Excel文件已生成: {len(files)}个文件")
+            self.excel_data = df
+            
+        except Exception as e:
+            self.excel_status_label.setText(f"生成Excel文件失败: {str(e)}")
+
+    def open_excel_file(self):
+        """打开Excel文件"""
+        # 如果没有Excel文件，先尝试生成
+        if not self.excel_file_path or not os.path.exists(self.excel_file_path):
+            if not self.rename_dir or not os.path.isdir(self.rename_dir):
+                QMessageBox.warning(self, "警告", "请先选择重命名目录以生成Excel文件")
+                return
+            
+            try:
+                files = [f for f in os.listdir(self.rename_dir) if os.path.isfile(os.path.join(self.rename_dir, f))]
+                self.generate_excel_file(files)
+            except Exception as e:
+                QMessageBox.warning(self, "错误", f"生成Excel文件失败: {str(e)}")
+                return
+        
+        # 检查Excel文件是否被占用
+        try:
+            test_df = pd.read_excel(self.excel_file_path, engine='openpyxl')
+            # 验证文件格式
+            if test_df.empty:
+                QMessageBox.warning(self, "错误", "Excel文件为空")
+                return
+            if '源文件名' not in test_df.columns or '重命名' not in test_df.columns:
+                QMessageBox.warning(self, "错误", "Excel文件格式不正确，缺少必要的列")
+                return
+        except Exception as e:
+            QMessageBox.warning(self, "错误", f"Excel文件被占用或损坏，请关闭Excel程序后重试: {str(e)}")
+            return
+        
+        try:
+            # 使用系统默认程序打开Excel文件
+            if sys.platform == "win32":
+                os.startfile(self.excel_file_path)
+            elif sys.platform == "darwin":  # macOS
+                os.system(f"open '{self.excel_file_path}'")
+            else:  # Linux
+                os.system(f"xdg-open '{self.excel_file_path}'")
+            
+            # 显示使用说明
+            msg_box = QMessageBox(self)
+            msg_box.setWindowTitle("使用说明")
+            msg_box.setText("Excel文件已打开，请按以下步骤操作：\n\n"
+                "1. 在'重命名'列中编辑每个文件的新名称\n"
+                "2. 如果新名称不包含文件扩展名，将自动保持原文件扩展名\n"
+                "3. 保存Excel文件并关闭\n"
+                "4. 返回程序点击'预览重命名'查看效果\n"
+                "5. 确认无误后点击'执行重命名'\n\n"
+                "注意：请勿修改'源文件名'列，只编辑'重命名'列")
+            msg_box.setIcon(QMessageBox.Icon.Information)
+            msg_box.setStandardButtons(QMessageBox.StandardButton.Ok)
+            # 设置弹窗置顶
+            msg_box.setWindowFlags(msg_box.windowFlags() | Qt.WindowType.WindowStaysOnTopHint)
+            msg_box.exec()
+            
+        except Exception as e:
+            QMessageBox.warning(self, "错误", f"无法打开Excel文件: {str(e)}")
+
+    def load_excel_data(self):
+        """加载Excel数据"""
+        if not self.excel_file_path or not os.path.exists(self.excel_file_path):
+            return None
+        
+        try:
+            df = pd.read_excel(self.excel_file_path, engine='openpyxl')
+            
+            # 验证DataFrame结构
+            if df.empty:
+                QMessageBox.warning(self, "错误", "Excel文件为空")
+                return None
+            
+            # 检查必要的列是否存在
+            required_columns = ['源文件名', '重命名']
+            missing_columns = [col for col in required_columns if col not in df.columns]
+            if missing_columns:
+                QMessageBox.warning(self, "错误", f"Excel文件缺少必要的列: {', '.join(missing_columns)}")
+                return None
+            
+            # 确保数据类型正确
+            df['源文件名'] = df['源文件名'].astype(str)
+            df['重命名'] = df['重命名'].astype(str)
+            
+            # 处理NaN值
+            df['源文件名'] = df['源文件名'].fillna('')
+            df['重命名'] = df['重命名'].fillna('')
+            
+            return df
+            
+        except Exception as e:
+            QMessageBox.warning(self, "错误", f"无法读取Excel文件: {str(e)}")
+            print(f"Excel文件读取详细错误: {str(e)}")
+            import traceback
+            traceback.print_exc()
+            return None
+
+    def clear_excel_cache(self):
+        """清除Excel文件缓存"""
+        try:
+            if self.temp_excel_dir and os.path.exists(self.temp_excel_dir):
+                # 尝试删除Excel文件
+                if self.excel_file_path and os.path.exists(self.excel_file_path):
+                    try:
+                        os.remove(self.excel_file_path)
+                    except PermissionError:
+                        # 如果文件被占用，等待一下再试
+                        import time
+                        time.sleep(1)
+                        try:
+                            os.remove(self.excel_file_path)
+                        except:
+                            pass  # 如果还是无法删除，就跳过
+                    except:
+                        pass  # 其他错误也跳过
+                
+                # 尝试删除临时目录
+                try:
+                    shutil.rmtree(self.temp_excel_dir)
+                except PermissionError:
+                    # 如果目录被占用，等待一下再试
+                    import time
+                    time.sleep(1)
+                    try:
+                        shutil.rmtree(self.temp_excel_dir)
+                    except:
+                        pass  # 如果还是无法删除，就跳过
+                except:
+                    pass  # 其他错误也跳过
+                
+                self.temp_excel_dir = None
+                self.excel_file_path = None
+                self.excel_data = None
+        except Exception as e:
+            print(f"清除Excel缓存失败: {str(e)}")
+            # 即使清除失败，也要重置变量
+            self.temp_excel_dir = None
+            self.excel_file_path = None
+            self.excel_data = None
 
     def preview_rename(self):
         """预览重命名结果"""
@@ -1060,6 +1281,16 @@ class FileSelector(QMainWindow):
         elif rename_type == 3 and not replace_from:
             QMessageBox.warning(self, "警告", "请输入要替换的原字段")
             return
+        elif rename_type == 5:  # Excel替换命名
+            # 加载Excel数据
+            df = self.load_excel_data()
+            if df is None:
+                QMessageBox.warning(self, "警告", "无法读取Excel文件，请确保文件已保存")
+                return
+            
+            # 直接处理Excel数据
+            self.process_excel_rename(df)
+            return
         
         # 显示进度条和取消按钮
         self.progress_bar.setVisible(True)
@@ -1095,6 +1326,47 @@ class FileSelector(QMainWindow):
         
         # 启动工作线程
         self.rename_worker.start()
+
+    def process_excel_rename(self, df):
+        """处理Excel重命名数据"""
+        try:
+            results = []
+            files = [f for f in os.listdir(self.rename_dir) if os.path.isfile(os.path.join(self.rename_dir, f))]
+            
+            # 创建文件名到新名称的映射
+            rename_map = {}
+            for index, row in df.iterrows():
+                try:
+                    old_name = str(row['源文件名']) if pd.notna(row['源文件名']) else ""
+                    new_name = str(row['重命名']) if pd.notna(row['重命名']) else ""
+                    
+                    if new_name and new_name != old_name:
+                        # 检查新名称是否包含文件扩展名
+                        if '.' not in new_name:
+                            # 如果没有扩展名，保持原文件的扩展名
+                            old_name_without_ext, ext = os.path.splitext(old_name)
+                            new_name = new_name + ext
+                        rename_map[old_name] = new_name
+                except Exception as e:
+                    print(f"处理第{index}行数据时出错: {str(e)}")
+                    continue
+            
+            # 生成重命名结果
+            for file in files:
+                if file in rename_map:
+                    new_name = rename_map[file]
+                    results.append((file, new_name))
+                else:
+                    results.append((file, file))  # 没有重命名的保持原名
+            
+            # 显示结果
+            self.on_rename_preview_result(results, len(files))
+            
+        except Exception as e:
+            QMessageBox.warning(self, "错误", f"处理Excel数据失败: {str(e)}")
+            print(f"Excel数据处理详细错误: {str(e)}")
+            import traceback
+            traceback.print_exc()
 
     def on_rename_progress(self, value, total):
         """更新重命名进度"""
@@ -1637,6 +1909,16 @@ class FileSelector(QMainWindow):
         # 停止动画计时器
         if self._search_anim_timer and self._search_anim_timer.isActive():
             self._search_anim_timer.stop()
+        
+        # 温和地清除Excel缓存（不强制删除被占用的文件）
+        try:
+            if self.temp_excel_dir and os.path.exists(self.temp_excel_dir):
+                # 只重置变量，不强制删除文件
+                self.temp_excel_dir = None
+                self.excel_file_path = None
+                self.excel_data = None
+        except:
+            pass
         
         # 接受关闭事件
         event.accept()
