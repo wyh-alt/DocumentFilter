@@ -126,6 +126,7 @@ class MatchWorker(QThread):
     error = pyqtSignal(str)
     progress = pyqtSignal(int, int)
     file_counts_ready = pyqtSignal(int, int)  # 新增信号：源目录和目标目录文件数量
+    unmatched_ready = pyqtSignal(list, list)  # 新增信号：未匹配的源文件和检索文本
     def __init__(self, match_method_index, source_dir, target_dir, match_basis, format_match, text_input, text_match_basis=0, use_multithreading=True):
         super().__init__()
         self.match_method_index = match_method_index
@@ -229,7 +230,10 @@ class MatchWorker(QThread):
                 return
             
             matched_pairs = []
-            if self.match_method_index == 0:
+            unmatched_source_files = []  # 未匹配的源文件
+            unmatched_keywords = []      # 未匹配的检索文本
+            
+            if self.match_method_index == 0:  # 根据源目录匹配提取
                 if not self.source_dir or not self.target_dir:
                     self.error.emit("请先选择源目录和目标目录")
                     return
@@ -271,6 +275,7 @@ class MatchWorker(QThread):
                 
                 total = len(source_files)
                 count = 0
+                matched_source_files = set()  # 记录已匹配的源文件
                 
                 if self.match_basis == 0:  # 完整文件名
                     # 检查是否使用多线程处理
@@ -291,6 +296,10 @@ class MatchWorker(QThread):
                             for future in concurrent.futures.as_completed(future_to_chunk):
                                 chunk_result = future.result()
                                 matched_pairs.extend(chunk_result)
+                                # 记录已匹配的源文件
+                                for s, t, s_name, t_name, key in chunk_result:
+                                    if s:
+                                        matched_source_files.add(s)
                                 completed += 1
                                 # 更新进度
                                 progress = int((completed / len(chunks)) * total)
@@ -299,18 +308,24 @@ class MatchWorker(QThread):
                         # 单线程处理
                         for s in source_files:
                             s_name = os.path.basename(s)
+                            matched = False
                             
                             if self.format_match:  # 匹配包括扩展名
                                 if s_name in target_dict:
                                     t = target_dict[s_name]
                                     t_name = os.path.basename(t)
                                     matched_pairs.append((s, t, s_name, t_name, s_name))
+                                    matched = True
                             else:  # 不匹配扩展名
                                 s_name_no_ext = os.path.splitext(s_name)[0]
                                 if s_name_no_ext in target_dict_no_ext:
                                     for t in target_dict_no_ext[s_name_no_ext]:
                                         t_name = os.path.basename(t)
                                         matched_pairs.append((s, t, s_name, t_name, s_name_no_ext))
+                                        matched = True
+                            
+                            if matched:
+                                matched_source_files.add(s)
                             
                             count += 1
                             if count % 20 == 0 or count == total:
@@ -352,6 +367,10 @@ class MatchWorker(QThread):
                             for future in concurrent.futures.as_completed(future_to_chunk):
                                 chunk_result = future.result()
                                 matched_pairs.extend(chunk_result)
+                                # 记录已匹配的源文件
+                                for s, t, s_name, t_name, key in chunk_result:
+                                    if s:
+                                        matched_source_files.add(s)
                                 completed += 1
                                 # 更新进度
                                 progress = int((completed / len(chunks)) * total)
@@ -368,12 +387,16 @@ class MatchWorker(QThread):
                                     for s in s_dict[tid]:
                                         s_name = os.path.basename(s)
                                         matched_pairs.append((s, t, s_name, t_name, tid))
+                                        matched_source_files.add(s)
                             
                             count += 1
                             if count % 20 == 0 or count == total:
                                 self.progress.emit(count, total)
+                
+                # 找出未匹配的源文件
+                unmatched_source_files = [s for s in source_files if s not in matched_source_files]
             
-            elif self.match_method_index == 1:
+            elif self.match_method_index == 1:  # 根据文本匹配提取
                 if not self.target_dir:
                     self.error.emit("请先选择目标目录")
                     return
@@ -405,13 +428,19 @@ class MatchWorker(QThread):
                         name_dict[t_name_no_ext] = (t, t_name)
                     
                     # 直接查找匹配项
+                    matched_keywords = set()
                     for kw in keywords:
                         if kw in name_dict:
                             t, t_name = name_dict[kw]
                             matched_pairs.append((None, t, '', t_name, kw))
+                            matched_keywords.add(kw)
+                    
+                    # 找出未匹配的关键字
+                    unmatched_keywords = [kw for kw in keywords if kw not in matched_keywords]
                 
                 else:  # 检索匹配
                     total = len(target_files)
+                    matched_keywords = set()
                     
                     # 检查是否使用多线程处理
                     if self.use_multithreading and len(target_files) > 100:
@@ -431,6 +460,9 @@ class MatchWorker(QThread):
                             for future in concurrent.futures.as_completed(future_to_chunk):
                                 chunk_result = future.result()
                                 matched_pairs.extend(chunk_result)
+                                # 记录已匹配的关键字
+                                for s, t, s_name, t_name, key in chunk_result:
+                                    matched_keywords.add(key)
                                 completed += 1
                                 # 更新进度
                                 progress = int((completed / len(chunks)) * total)
@@ -445,11 +477,18 @@ class MatchWorker(QThread):
                             for kw in keywords:
                                 if kw in t_name:
                                     matched_pairs.append((None, t, '', t_name, kw))
+                                    matched_keywords.add(kw)
                                     break
                             
                             count += 1
                             if count % 20 == 0 or count == total:
                                 self.progress.emit(count, total)
+                    
+                    # 找出未匹配的关键字
+                    unmatched_keywords = [kw for kw in keywords if kw not in matched_keywords]
+            
+            # 发送未匹配文件信号
+            self.unmatched_ready.emit(unmatched_source_files, unmatched_keywords)
             
             self.result_ready.emit(matched_pairs, len(matched_pairs))
         except Exception as e:
@@ -562,7 +601,7 @@ class FileSelector(QMainWindow):
         self.setWindowIcon(create_app_icon())
 
     def init_ui(self):
-        self.setWindowTitle("文件处理工具 v2.1        *使用遇到bug或有功能建议请及时联系王永皓")
+        self.setWindowTitle("文件处理工具 v2.2        *使用遇到bug或有功能建议请及时联系王永皓")
         self.setGeometry(300, 300, 1000, 800)
         central_widget = QWidget()
         self.setCentralWidget(central_widget)
@@ -600,22 +639,6 @@ class FileSelector(QMainWindow):
         # 目录选择区域
         dir_group = QGroupBox("目录设置")
         dir_layout = QVBoxLayout()
-        # 源目录选择
-        source_layout = QHBoxLayout()
-        source_layout.addWidget(QLabel("源目录:"))
-        self.source_label = QLabel("未选择")
-        self.source_label.setFrameStyle(QFrame.Shape.StyledPanel | QFrame.Shadow.Sunken)
-        self.source_label.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
-        self.source_label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse | Qt.TextInteractionFlag.TextBrowserInteraction)
-        self.source_label.setWordWrap(False)
-        self.source_label.setToolTip("未选择")
-        self.source_label.setAcceptDrops(True)
-        self.source_label.dragEnterEvent = self.drag_enter_event
-        self.source_label.dropEvent = lambda event: self.drop_event(event, "source")
-        source_btn = QPushButton("浏览...")
-        source_btn.clicked.connect(lambda: self.select_directory("source"))
-        source_layout.addWidget(self.source_label, 1)
-        source_layout.addWidget(source_btn, 0)
         # 目标目录选择
         target_layout = QHBoxLayout()
         target_layout.addWidget(QLabel("目标目录:"))
@@ -652,7 +675,6 @@ class FileSelector(QMainWindow):
         output_btn.clicked.connect(lambda: self.select_directory("output"))
         output_layout.addWidget(self.output_label, 1)
         output_layout.addWidget(output_btn, 0)
-        dir_layout.addLayout(source_layout)
         dir_layout.addLayout(target_layout)
         dir_layout.addLayout(output_layout)
         dir_group.setLayout(dir_layout)
@@ -673,6 +695,23 @@ class FileSelector(QMainWindow):
         self.match_options_layout = QVBoxLayout(self.match_options_widget)
         # 源目录匹配提取设置
         self.dir_match_layout = QVBoxLayout()
+        # 源目录选择
+        source_layout = QHBoxLayout()
+        source_layout.addWidget(QLabel("源目录:"))
+        self.source_label = QLabel("未选择")
+        self.source_label.setFrameStyle(QFrame.Shape.StyledPanel | QFrame.Shadow.Sunken)
+        self.source_label.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
+        self.source_label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse | Qt.TextInteractionFlag.TextBrowserInteraction)
+        self.source_label.setWordWrap(False)
+        self.source_label.setToolTip("未选择")
+        self.source_label.setAcceptDrops(True)
+        self.source_label.dragEnterEvent = self.drag_enter_event
+        self.source_label.dropEvent = lambda event: self.drop_event(event, "source")
+        source_btn = QPushButton("浏览...")
+        source_btn.clicked.connect(lambda: self.select_directory("source"))
+        source_layout.addWidget(self.source_label, 1)
+        source_layout.addWidget(source_btn, 0)
+        self.dir_match_layout.addLayout(source_layout)
         # 匹配依据
         match_basis_row = QHBoxLayout()
         match_basis_row.addWidget(QLabel("匹配依据:"))
@@ -1624,6 +1663,8 @@ class FileSelector(QMainWindow):
                         subitem = item.layout().itemAt(j)
                         if subitem and subitem.widget():
                             subitem.widget().show()
+            # 设置表格列标题为源文件
+            self.result_table.setHorizontalHeaderLabels(["选择", "源文件", "目标文件"])
         elif index == 1:  # 根据文本匹配提取
             self.match_options_widget.show()
             for i in range(self.text_match_layout.count()):
@@ -1635,6 +1676,8 @@ class FileSelector(QMainWindow):
                         subitem = item.layout().itemAt(j)
                         if subitem and subitem.widget():
                             subitem.widget().show()
+            # 设置表格列标题为检索文本
+            self.result_table.setHorizontalHeaderLabels(["选择", "检索文本", "目标文件"])
 
     def match_files(self):
         # 如果有正在运行的匹配任务，先取消它
@@ -1682,6 +1725,7 @@ class FileSelector(QMainWindow):
         self.worker.error.connect(self.on_match_error)
         self.worker.progress.connect(self.on_match_progress)
         self.worker.file_counts_ready.connect(self.on_file_counts_ready)
+        self.worker.unmatched_ready.connect(self.on_unmatched_ready)
         
         # 启动工作线程
         QApplication.processEvents()  # 在启动线程前处理所有待处理的事件
@@ -1725,35 +1769,88 @@ class FileSelector(QMainWindow):
         # 清除旧的高亮信息
         self.html_delegate.highlights.clear()
         
-        # 设置表格行数
-        self.result_table.setRowCount(matched_count)
+        # 计算总行数（包括未匹配的文件）
+        total_rows = matched_count
+        if hasattr(self, 'unmatched_source_files'):
+            total_rows += len(self.unmatched_source_files)
+        if hasattr(self, 'unmatched_keywords'):
+            total_rows += len(self.unmatched_keywords)
         
-        # 填充表格
-        for row, (s, t, s_name, t_name, key) in enumerate(matched_pairs):
+        # 设置表格行数
+        self.result_table.setRowCount(total_rows)
+        
+        current_row = 0
+        
+        # 首先显示未匹配的文件（红色字体）
+        if hasattr(self, 'unmatched_source_files') and self.unmatched_source_files:
+            for unmatched_file in self.unmatched_source_files:
+                # 复选框
+                checkbox_widget = CheckBoxWidget()
+                checkbox_widget.setChecked(False)  # 未匹配的文件默认不选中
+                self.result_table.setCellWidget(current_row, 0, checkbox_widget)
+                
+                # 源文件列（红色字体）
+                source_item = QTableWidgetItem(os.path.basename(unmatched_file))
+                source_item.setForeground(QColor(255, 0, 0))  # 红色字体
+                self.result_table.setItem(current_row, 1, source_item)
+                
+                # 目标文件列（空）
+                self.result_table.setItem(current_row, 2, QTableWidgetItem(""))
+                
+                # 存储文件数据（未匹配的源文件）
+                self.matched_files.append((unmatched_file, None, os.path.basename(unmatched_file), "", ""))
+                
+                current_row += 1
+        
+        # 显示未匹配的关键字（红色字体）
+        if hasattr(self, 'unmatched_keywords') and self.unmatched_keywords:
+            for unmatched_keyword in self.unmatched_keywords:
+                # 复选框
+                checkbox_widget = CheckBoxWidget()
+                checkbox_widget.setChecked(False)  # 未匹配的关键字默认不选中
+                self.result_table.setCellWidget(current_row, 0, checkbox_widget)
+                
+                # 检索文本列（红色字体）
+                keyword_item = QTableWidgetItem(unmatched_keyword)
+                keyword_item.setForeground(QColor(255, 0, 0))  # 红色字体
+                self.result_table.setItem(current_row, 1, keyword_item)
+                
+                # 目标文件列（空）
+                self.result_table.setItem(current_row, 2, QTableWidgetItem(""))
+                
+                # 存储文件数据（未匹配的关键字）
+                self.matched_files.append((None, None, unmatched_keyword, "", ""))
+                
+                current_row += 1
+        
+        # 然后显示匹配的文件
+        for s, t, s_name, t_name, key in matched_pairs:
             # 复选框
             checkbox_widget = CheckBoxWidget()
             checkbox_widget.setChecked(True)
-            self.result_table.setCellWidget(row, 0, checkbox_widget)
+            self.result_table.setCellWidget(current_row, 0, checkbox_widget)
             
             # 源文件列
             if s:
                 source_item = QTableWidgetItem(s_name)
-                self.result_table.setItem(row, 1, source_item)
+                self.result_table.setItem(current_row, 1, source_item)
                 # 如果有匹配关键字，设置单元格部分文本颜色
                 if key and key in s_name:
-                    self._highlight_cell_text(row, 1, key)
+                    self._highlight_cell_text(current_row, 1, key)
             else:
-                self.result_table.setItem(row, 1, QTableWidgetItem(""))
+                self.result_table.setItem(current_row, 1, QTableWidgetItem(""))
             
             # 目标文件列
             target_item = QTableWidgetItem(t_name)
-            self.result_table.setItem(row, 2, target_item)
+            self.result_table.setItem(current_row, 2, target_item)
             # 如果有匹配关键字，设置单元格部分文本颜色
             if key and key in t_name:
-                self._highlight_cell_text(row, 2, key)
+                self._highlight_cell_text(current_row, 2, key)
             
             # 存储文件数据
             self.matched_files.append((s, t, s_name, t_name, key))
+            
+            current_row += 1
         
         self.match_count_label.setText(f"匹配文件总数: {matched_count}")
         if matched_count == 0:
@@ -1847,7 +1944,22 @@ class FileSelector(QMainWindow):
                     break
                 
                 try:
-                    src_path = t if s is None else t  # 只处理目标文件
+                    # 检查是否为未匹配的文件（没有目标文件路径）
+                    if t is None:
+                        if operation == "delete":
+                            # 对于未匹配的源文件，可以删除源文件
+                            if s:
+                                os.remove(s)
+                                processed += 1
+                            else:
+                                # 对于未匹配的关键字，无法执行操作
+                                failed += 1
+                        else:
+                            # 复制和移动操作需要目标文件，未匹配的文件无法操作
+                            failed += 1
+                        continue
+                    
+                    src_path = t  # 只处理目标文件
                     filename = t_name
                     if operation == "copy":
                         dest_path = os.path.join(self.output_dir, filename)
@@ -1859,7 +1971,7 @@ class FileSelector(QMainWindow):
                         os.remove(src_path)
                     processed += 1
                 except Exception as e:
-                    QMessageBox.critical(self, "错误", f"处理文件 {filename} 时出错: {str(e)}")
+                    QMessageBox.critical(self, "错误", f"处理文件 {filename if 'filename' in locals() else s_name} 时出错: {str(e)}")
                     failed += 1
                 finally:
                     # 更新进度条
@@ -1922,6 +2034,11 @@ class FileSelector(QMainWindow):
         
         # 接受关闭事件
         event.accept()
+
+    def on_unmatched_ready(self, unmatched_source_files, unmatched_keywords):
+        """处理未匹配的文件和关键字"""
+        self.unmatched_source_files = unmatched_source_files
+        self.unmatched_keywords = unmatched_keywords
 
 if __name__ == "__main__":
     app = QApplication(sys.argv)
