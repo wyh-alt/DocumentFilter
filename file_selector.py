@@ -127,7 +127,7 @@ class MatchWorker(QThread):
     progress = pyqtSignal(int, int)
     file_counts_ready = pyqtSignal(int, int)  # 新增信号：源目录和目标目录文件数量
     unmatched_ready = pyqtSignal(list, list)  # 新增信号：未匹配的源文件和检索文本
-    def __init__(self, match_method_index, source_dir, target_dir, match_basis, format_match, text_input, text_match_basis=0, use_multithreading=True):
+    def __init__(self, match_method_index, source_dir, target_dir, match_basis, format_match, text_input, text_match_basis=0, expand_search=False, use_multithreading=True):
         super().__init__()
         self.match_method_index = match_method_index
         self.source_dir = source_dir
@@ -136,6 +136,7 @@ class MatchWorker(QThread):
         self.format_match = format_match
         self.text_input = text_input
         self.text_match_basis = text_match_basis
+        self.expand_search = expand_search
         self.use_multithreading = use_multithreading
         # 设置线程数为CPU核心数
         self.thread_count = max(4, os.cpu_count() or 4)
@@ -203,7 +204,7 @@ class MatchWorker(QThread):
             
             for kw in keywords:
                 if kw in t_name:
-                    result.append((None, t, '', t_name, kw))
+                    result.append((None, t, kw, t_name, kw))
                     break
         return result
     
@@ -442,47 +443,80 @@ class MatchWorker(QThread):
                     total = len(target_files)
                     matched_keywords = set()
                     
-                    # 检查是否使用多线程处理
-                    if self.use_multithreading and len(target_files) > 100:
-                        # 分割目标文件列表为多个块
-                        chunks = self._split_list(target_files, self.thread_count)
+                    if not self.expand_search:  # 精确匹配模式
+                        # 为每个关键字找到最佳匹配的文件
+                        keyword_best_matches = {}  # 存储每个关键字的最佳匹配
                         
-                        # 使用线程池并行处理
-                        with concurrent.futures.ThreadPoolExecutor(max_workers=self.thread_count) as executor:
-                            # 提交任务
-                            future_to_chunk = {
-                                executor.submit(self._process_chunk_by_text, chunk, keywords): i 
-                                for i, chunk in enumerate(chunks)
-                            }
-                            
-                            # 处理结果
-                            completed = 0
-                            for future in concurrent.futures.as_completed(future_to_chunk):
-                                chunk_result = future.result()
-                                matched_pairs.extend(chunk_result)
-                                # 记录已匹配的关键字
-                                for s, t, s_name, t_name, key in chunk_result:
-                                    matched_keywords.add(key)
-                                completed += 1
-                                # 更新进度
-                                progress = int((completed / len(chunks)) * total)
-                                self.progress.emit(progress, total)
-                    else:
-                        # 单线程处理
-                        count = 0
                         for t in target_files:
                             t_name = os.path.basename(t)
+                            t_name_no_ext = os.path.splitext(t_name)[0]
                             
-                            # 优化6: 一次检查所有关键字
                             for kw in keywords:
-                                if kw in t_name:
-                                    matched_pairs.append((None, t, '', t_name, kw))
-                                    matched_keywords.add(kw)
-                                    break
+                                if kw in t_name_no_ext:
+                                    # 计算匹配度（精确匹配优先）
+                                    if t_name_no_ext == kw:
+                                        # 完全匹配，最高优先级
+                                        match_score = 100
+                                    elif t_name_no_ext.startswith(kw + '-') or t_name_no_ext.startswith(kw + '_'):
+                                        # 以关键字开头，次高优先级
+                                        match_score = 80
+                                    elif t_name_no_ext.endswith('-' + kw) or t_name_no_ext.endswith('_' + kw):
+                                        # 以关键字结尾，中等优先级
+                                        match_score = 60
+                                    else:
+                                        # 包含关键字，最低优先级
+                                        match_score = 40
+                                    
+                                    # 如果这个关键字还没有匹配，或者当前匹配度更高，则更新
+                                    if kw not in keyword_best_matches or match_score > keyword_best_matches[kw][2]:
+                                        keyword_best_matches[kw] = (t, t_name, match_score)
+                        
+                        # 将最佳匹配添加到结果中
+                        for kw, (t, t_name, score) in keyword_best_matches.items():
+                            matched_pairs.append((None, t, kw, t_name, kw))
+                            matched_keywords.add(kw)
+                    
+                    else:  # 扩大匹配模式
+                        # 检查是否使用多线程处理
+                        if self.use_multithreading and len(target_files) > 100:
+                            # 分割目标文件列表为多个块
+                            chunks = self._split_list(target_files, self.thread_count)
                             
-                            count += 1
-                            if count % 20 == 0 or count == total:
-                                self.progress.emit(count, total)
+                            # 使用线程池并行处理
+                            with concurrent.futures.ThreadPoolExecutor(max_workers=self.thread_count) as executor:
+                                # 提交任务
+                                future_to_chunk = {
+                                    executor.submit(self._process_chunk_by_text, chunk, keywords): i 
+                                    for i, chunk in enumerate(chunks)
+                                }
+                                
+                                # 处理结果
+                                completed = 0
+                                for future in concurrent.futures.as_completed(future_to_chunk):
+                                    chunk_result = future.result()
+                                    matched_pairs.extend(chunk_result)
+                                    # 记录已匹配的关键字
+                                    for s, t, s_name, t_name, key in chunk_result:
+                                        matched_keywords.add(key)
+                                    completed += 1
+                                    # 更新进度
+                                    progress = int((completed / len(chunks)) * total)
+                                    self.progress.emit(progress, total)
+                        else:
+                            # 单线程处理
+                            count = 0
+                            for t in target_files:
+                                t_name = os.path.basename(t)
+                                
+                                # 检查所有关键字
+                                for kw in keywords:
+                                    if kw in t_name:
+                                        matched_pairs.append((None, t, kw, t_name, kw))
+                                        matched_keywords.add(kw)
+                                
+                                count += 1
+                                if count % 20 == 0 or count == total:
+                                    self.progress.emit(count, total)
                     
                     # 找出未匹配的关键字
                     unmatched_keywords = [kw for kw in keywords if kw not in matched_keywords]
@@ -740,8 +774,28 @@ class FileSelector(QMainWindow):
         text_match_basis_row.addWidget(QLabel("匹配依据:"))
         self.text_match_basis_combo = QComboBox()
         self.text_match_basis_combo.addItems(["完全匹配", "检索匹配"])
+        self.text_match_basis_combo.currentIndexChanged.connect(self.on_text_match_basis_changed)
         text_match_basis_row.addWidget(self.text_match_basis_combo)
         self.text_match_layout.addLayout(text_match_basis_row)
+        
+        # 添加扩大文件名检索范围选项
+        expand_search_row = QHBoxLayout()
+        expand_search_row.addWidget(QLabel("扩大文件名检索范围:"))
+        self.expand_search_checkbox = QCheckBox()
+        self.expand_search_checkbox.setChecked(False)  # 默认取消勾选
+        expand_search_row.addWidget(self.expand_search_checkbox)
+        
+        # 添加功能说明标签
+        info_label = QLabel("ⓘ")
+        info_label.setToolTip("当未勾选时，根据用户检索内容进行文件一对一匹配，当多个文件包含用户提供的文本时，仅保留匹配度最高的文件。\n例如检索文本'123'，仅匹配'123-原唱'，忽略'1234-原唱'以及'11234-原唱'，避免重复匹配。\n当勾选该选项时，将对目录内包含检索文本的所有文件进行匹配。")
+        expand_search_row.addWidget(info_label)
+        
+        self.text_match_layout.addLayout(expand_search_row)
+        
+        # 初始状态：隐藏扩大检索范围选项
+        self.expand_search_checkbox.hide()
+        expand_search_row.itemAt(0).widget().hide()  # 隐藏标签
+        expand_search_row.itemAt(2).widget().hide()  # 隐藏说明标签
         
         # 添加所有布局到选项容器
         self.match_options_layout.addLayout(self.dir_match_layout)
@@ -1678,6 +1732,28 @@ class FileSelector(QMainWindow):
                             subitem.widget().show()
             # 设置表格列标题为检索文本
             self.result_table.setHorizontalHeaderLabels(["选择", "检索文本", "目标文件"])
+            # 检查文本匹配依据，决定是否显示扩大检索范围选项
+            self.on_text_match_basis_changed(self.text_match_basis_combo.currentIndex())
+
+    def on_text_match_basis_changed(self, index):
+        """根据文本匹配依据的变化，更新扩大检索范围选项的可见性"""
+        # 只有当选择"检索匹配"时才显示扩大检索范围选项
+        if index == 1:  # 检索匹配
+            self.expand_search_checkbox.show()
+            # 显示标签和说明
+            expand_search_row = self.text_match_layout.itemAt(3)  # 扩大检索范围选项的布局
+            if expand_search_row and expand_search_row.layout():
+                expand_search_row.layout().itemAt(0).widget().show()  # 显示标签
+                expand_search_row.layout().itemAt(2).widget().show()  # 显示说明标签
+        else:  # 完全匹配
+            self.expand_search_checkbox.hide()
+            # 隐藏标签和说明
+            expand_search_row = self.text_match_layout.itemAt(3)  # 扩大检索范围选项的布局
+            if expand_search_row and expand_search_row.layout():
+                expand_search_row.layout().itemAt(0).widget().hide()  # 隐藏标签
+                expand_search_row.layout().itemAt(2).widget().hide()  # 隐藏说明标签
+            # 重置勾选状态
+            self.expand_search_checkbox.setChecked(False)
 
     def match_files(self):
         # 如果有正在运行的匹配任务，先取消它
@@ -1717,6 +1793,7 @@ class FileSelector(QMainWindow):
             format_match, 
             text_input, 
             text_match_basis, 
+            self.expand_search_checkbox.isChecked(), 
             use_multithreading
         )
         
@@ -1830,15 +1907,21 @@ class FileSelector(QMainWindow):
             checkbox_widget.setChecked(True)
             self.result_table.setCellWidget(current_row, 0, checkbox_widget)
             
-            # 源文件列
+            # 源文件列或检索文本列
             if s:
+                # 源目录匹配模式：显示源文件名
                 source_item = QTableWidgetItem(s_name)
                 self.result_table.setItem(current_row, 1, source_item)
                 # 如果有匹配关键字，设置单元格部分文本颜色
                 if key and key in s_name:
                     self._highlight_cell_text(current_row, 1, key)
             else:
-                self.result_table.setItem(current_row, 1, QTableWidgetItem(""))
+                # 文本匹配模式：显示检索文本
+                source_item = QTableWidgetItem(s_name if s_name else key)
+                self.result_table.setItem(current_row, 1, source_item)
+                # 如果有匹配关键字，设置单元格部分文本颜色
+                if key and key in (s_name if s_name else key):
+                    self._highlight_cell_text(current_row, 1, key)
             
             # 目标文件列
             target_item = QTableWidgetItem(t_name)
