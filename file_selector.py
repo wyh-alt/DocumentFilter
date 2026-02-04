@@ -8,6 +8,8 @@ import shutil
 import concurrent.futures
 import tempfile
 import pandas as pd
+from openpyxl import Workbook
+from openpyxl.styles import Font, Alignment
 from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, 
                            QListWidget, QListWidgetItem, QPushButton, QFileDialog, QLabel,
                            QCheckBox, QMessageBox, QProgressBar, QComboBox, QGroupBox,
@@ -843,6 +845,10 @@ class FileSelector(QMainWindow):
         self.delete_btn = QPushButton("删除选中文件")
         self.delete_btn.clicked.connect(lambda: self.process_files("delete"))
         op_layout.addWidget(self.delete_btn)
+        # 导出结果表格按钮
+        self.export_result_btn = QPushButton("导出结果表格")
+        self.export_result_btn.clicked.connect(self.export_result_table_to_excel)
+        op_layout.addWidget(self.export_result_btn)
         op_group.setLayout(op_layout)
         left_layout.addWidget(op_group)
         left_layout.addStretch()
@@ -1971,6 +1977,54 @@ class FileSelector(QMainWindow):
             checkbox_widget = self.result_table.cellWidget(row, 0)
             if checkbox_widget:
                 checkbox_widget.setChecked(not checkbox_widget.isChecked())
+
+    def export_result_table_to_excel(self):
+        """将右侧匹配结果表格导出为 Excel，仅包含源文件、目标文件列及红色未匹配样式"""
+        if not self.result_table.rowCount():
+            QMessageBox.warning(self, "警告", "没有可导出的结果，请先执行匹配")
+            return
+        file_path, _ = QFileDialog.getSaveFileName(
+            self, "导出结果表格", "", "Excel 文件 (*.xlsx)"
+        )
+        if not file_path:
+            return
+        if not file_path.endswith(".xlsx"):
+            file_path += ".xlsx"
+        try:
+            wb = Workbook()
+            ws = wb.active
+            ws.title = "匹配结果"
+            # 表头：仅源文件、目标文件
+            headers = ["源文件", "目标文件"]
+            for col, title in enumerate(headers, 1):
+                cell = ws.cell(row=1, column=col, value=title)
+                cell.font = Font(bold=True)
+                cell.alignment = Alignment(horizontal="center", vertical="center")
+            # 数据行
+            red_font = Font(color="FF0000")
+            for row in range(self.result_table.rowCount()):
+                excel_row = row + 2
+                # 源文件列
+                source_item = self.result_table.item(row, 1)
+                source_text = source_item.text() if source_item else ""
+                cell_source = ws.cell(row=excel_row, column=1, value=source_text)
+                if source_item and source_item.foreground().color().red() > 200:
+                    cell_source.font = red_font
+                # 目标文件列
+                target_item = self.result_table.item(row, 2)
+                target_text = target_item.text() if target_item else ""
+                cell_target = ws.cell(row=excel_row, column=2, value=target_text)
+                if target_item and target_item.foreground().color().red() > 200:
+                    cell_target.font = red_font
+            # 列宽：源/目标列根据内容自适应
+            max_source = max((len(self.result_table.item(r, 1).text()) if self.result_table.item(r, 1) else 0 for r in range(self.result_table.rowCount())), default=0)
+            max_target = max((len(self.result_table.item(r, 2).text()) if self.result_table.item(r, 2) else 0 for r in range(self.result_table.rowCount())), default=0)
+            ws.column_dimensions["A"].width = min(50, max(20, max_source + 2))
+            ws.column_dimensions["B"].width = min(50, max(20, max_target + 2))
+            wb.save(file_path)
+            QMessageBox.information(self, "提示", f"已导出到:\n{file_path}")
+        except Exception as e:
+            QMessageBox.critical(self, "错误", f"导出失败: {e}")
 
     def process_files(self, operation):
         if not self.result_table.rowCount():
