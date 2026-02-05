@@ -637,7 +637,7 @@ class FileSelector(QMainWindow):
         self.setWindowIcon(create_app_icon())
 
     def init_ui(self):
-        self.setWindowTitle("文件处理工具 v2.2        *使用遇到bug或有功能建议请及时联系王永皓")
+        self.setWindowTitle("文件处理工具 v2.3        *使用遇到bug或有功能建议请及时联系王永皓")
         self.setGeometry(300, 300, 1000, 800)
         central_widget = QWidget()
         self.setCentralWidget(central_widget)
