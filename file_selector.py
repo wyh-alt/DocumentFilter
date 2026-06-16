@@ -7,6 +7,7 @@ import re
 import shutil
 import concurrent.futures
 import tempfile
+import uuid
 import pandas as pd
 from openpyxl import Workbook
 from openpyxl.styles import Font, Alignment
@@ -19,6 +20,54 @@ from PyQt6.QtCore import Qt, QMimeData, QUrl, QThread, pyqtSignal, QTimer
 from PyQt6.QtGui import QDrag, QDropEvent, QIcon, QFont, QColor, QTextDocument, QAbstractTextDocumentLayout, QPainter, QPixmap
 
 from file_matcher import FileMatcher
+
+IGNORED_FILENAMES = {"desktop.ini", "thumbs.db", ".ds_store"}
+
+
+def is_visible_file(directory, filename):
+    """判断文件是否应参与业务处理（过滤系统隐藏文件）。"""
+    if not filename:
+        return False
+
+    # 跨平台隐藏文件（以 . 开头）直接忽略，例如 .DS_Store。
+    if filename.startswith("."):
+        return False
+
+    if filename.lower() in IGNORED_FILENAMES:
+        return False
+
+    file_path = os.path.join(directory, filename)
+    if not os.path.isfile(file_path):
+        return False
+
+    if os.name == "nt":
+        try:
+            import ctypes
+            attrs = ctypes.windll.kernel32.GetFileAttributesW(str(file_path))
+            if attrs != -1:
+                file_attr_hidden = 0x2
+                file_attr_system = 0x4
+                if attrs & (file_attr_hidden | file_attr_system):
+                    return False
+        except Exception:
+            # 获取系统属性失败时，回退到仅文件名过滤，避免阻断主流程。
+            pass
+
+    return True
+
+
+def list_visible_files(directory):
+    """返回目录中可参与处理的文件完整路径列表。"""
+    if not directory or not os.path.isdir(directory):
+        return []
+    return [os.path.join(directory, f) for f in os.listdir(directory) if is_visible_file(directory, f)]
+
+
+def list_visible_filenames(directory):
+    """返回目录中可参与处理的文件名列表。"""
+    if not directory or not os.path.isdir(directory):
+        return []
+    return [f for f in os.listdir(directory) if is_visible_file(directory, f)]
 
 # 创建应用图标
 def create_app_icon():
@@ -150,12 +199,7 @@ class MatchWorker(QThread):
     
     def _load_files(self, directory):
         """延迟加载文件列表"""
-        if not directory or not os.path.isdir(directory):
-            return []
-        
-        # 使用生成器表达式，避免一次性加载所有文件到内存
-        return [os.path.join(directory, f) for f in os.listdir(directory) 
-                if os.path.isfile(os.path.join(directory, f))]
+        return list_visible_files(directory)
     
     def _split_list(self, items, num_chunks):
         """将列表分割成多个块，用于并行处理"""
@@ -218,12 +262,10 @@ class MatchWorker(QThread):
             
             # 使用更高效的方式统计文件数量
             if self.source_dir and os.path.isdir(self.source_dir):
-                source_count = sum(1 for f in os.listdir(self.source_dir) 
-                                 if os.path.isfile(os.path.join(self.source_dir, f)))
+                source_count = len(list_visible_files(self.source_dir))
             
             if self.target_dir and os.path.isdir(self.target_dir):
-                target_count = sum(1 for f in os.listdir(self.target_dir) 
-                                 if os.path.isfile(os.path.join(self.target_dir, f)))
+                target_count = len(list_visible_files(self.target_dir))
             
             # 发送文件数量信号
             self.file_counts_ready.emit(source_count, target_count)
@@ -419,7 +461,7 @@ class MatchWorker(QThread):
                 keywords_set = set(keywords)
                 
                 # 获取所有目标文件
-                target_files = [os.path.join(self.target_dir, f) for f in os.listdir(self.target_dir) if os.path.isfile(os.path.join(self.target_dir, f))]
+                target_files = list_visible_files(self.target_dir)
                 
                 # 优化5: 根据匹配模式预处理文件名
                 if text_match_basis == 0:  # 完全匹配
@@ -563,7 +605,7 @@ class RenameWorker(QThread):
                 self.error.emit("请选择有效的目录")
                 return
             
-            files = [f for f in os.listdir(self.directory) if os.path.isfile(os.path.join(self.directory, f))]
+            files = list_visible_filenames(self.directory)
             
             # 发送文件数量信号
             self.file_count_ready.emit(len(files))
@@ -1087,7 +1129,7 @@ class FileSelector(QMainWindow):
             # 如果已经选择了重命名目录，自动生成Excel文件
             if self.rename_dir and os.path.isdir(self.rename_dir):
                 try:
-                    files = [f for f in os.listdir(self.rename_dir) if os.path.isfile(os.path.join(self.rename_dir, f))]
+                    files = list_visible_filenames(self.rename_dir)
                     self.generate_excel_file(files)
                 except Exception as e:
                     self.excel_status_label.setText(f"生成Excel文件失败: {str(e)}")
@@ -1152,7 +1194,7 @@ class FileSelector(QMainWindow):
             return
         
         try:
-            files = [f for f in os.listdir(self.rename_dir) if os.path.isfile(os.path.join(self.rename_dir, f))]
+            files = list_visible_filenames(self.rename_dir)
             self.rename_file_count_label.setText(f"目录文件数: {len(files)}")
             
             # 如果选择了Excel替换命名，自动生成Excel文件
@@ -1213,7 +1255,7 @@ class FileSelector(QMainWindow):
                 return
             
             try:
-                files = [f for f in os.listdir(self.rename_dir) if os.path.isfile(os.path.join(self.rename_dir, f))]
+                files = list_visible_filenames(self.rename_dir)
                 self.generate_excel_file(files)
             except Exception as e:
                 QMessageBox.warning(self, "错误", f"生成Excel文件失败: {str(e)}")
@@ -1430,7 +1472,7 @@ class FileSelector(QMainWindow):
         """处理Excel重命名数据"""
         try:
             results = []
-            files = [f for f in os.listdir(self.rename_dir) if os.path.isfile(os.path.join(self.rename_dir, f))]
+            files = list_visible_filenames(self.rename_dir)
             
             # 创建文件名到新名称的映射
             rename_map = {}
@@ -1527,9 +1569,16 @@ class FileSelector(QMainWindow):
         if not self.rename_results:
             QMessageBox.warning(self, "警告", "请先预览重命名结果")
             return
+
+        # 仅处理实际发生变化的记录，避免无意义重命名。
+        changed_results = [(old_name, new_name) for old_name, new_name in self.rename_results if old_name != new_name]
+        if not changed_results:
+            QMessageBox.information(self, "提示", "没有检测到需要重命名的文件")
+            self.execute_rename_btn.setEnabled(False)
+            return
         
         reply = QMessageBox.question(self, "确认操作", 
-                                     f"确定要重命名 {len(self.rename_results)} 个文件吗？",
+                                     f"确定要重命名 {len(changed_results)} 个文件吗？",
                                      QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
         if reply != QMessageBox.StandardButton.Yes:
             return
@@ -1537,7 +1586,7 @@ class FileSelector(QMainWindow):
         # 显示进度条和取消按钮
         self.progress_bar.setVisible(True)
         self.progress_bar.setValue(0)
-        self.progress_bar.setMaximum(len(self.rename_results))
+        self.progress_bar.setMaximum(len(changed_results))
         self.cancel_btn.setVisible(True)
         self.cancel_btn.setEnabled(True)
         
@@ -1552,38 +1601,69 @@ class FileSelector(QMainWindow):
         success_count = 0
         error_count = 0
         rename_operations = []  # 记录重命名操作，用于撤回
+        staged_records = []  # 记录阶段一临时重命名，用于冲突安全处理和回滚
+        phase1_completed = False
         
         try:
-            for i, (old_name, new_name) in enumerate(self.rename_results):
+            # 第一阶段：全部先改为唯一临时名，彻底释放目标名称，避免互相占用导致失败。
+            for i, (old_name, new_name) in enumerate(changed_results):
                 # 检查取消状态
                 QApplication.processEvents()
                 if not self.cancel_btn.isEnabled():
                     self.rename_status_label.setText("重命名已取消")
                     break
-                
-                try:
-                    old_path = os.path.join(self.rename_dir, old_name)
-                    new_path = os.path.join(self.rename_dir, new_name)
-                    
-                    # 检查目标文件是否已存在
-                    if os.path.exists(new_path) and old_path != new_path:
-                        # 如果目标文件已存在，使用临时文件名
-                        temp_path = new_path + ".temp"
-                        os.rename(old_path, temp_path)
-                        os.rename(temp_path, new_path)
-                    else:
-                        os.rename(old_path, new_path)
-                    
-                    # 记录重命名操作
-                    rename_operations.append((new_name, old_name))
-                    success_count += 1
-                except Exception as e:
-                    error_count += 1
-                    print(f"重命名文件 {old_name} 时出错: {str(e)}")
-                
-                # 更新进度
+
+                old_path = os.path.join(self.rename_dir, old_name)
+                if not os.path.exists(old_path):
+                    raise FileNotFoundError(f"源文件不存在: {old_name}")
+
+                temp_name = f".rename_tmp_{uuid.uuid4().hex}_{i}"
+                temp_path = os.path.join(self.rename_dir, temp_name)
+                while os.path.exists(temp_path):
+                    temp_name = f".rename_tmp_{uuid.uuid4().hex}_{i}"
+                    temp_path = os.path.join(self.rename_dir, temp_name)
+
+                os.rename(old_path, temp_path)
+                staged_records.append((temp_path, old_name, new_name))
                 self.progress_bar.setValue(i + 1)
-                self.rename_status_label.setText(f"正在重命名文件... {i+1}/{len(self.rename_results)}")
+                self.rename_status_label.setText(f"正在准备重命名... {i+1}/{len(changed_results)}")
+
+            phase1_completed = len(staged_records) == len(changed_results)
+
+            # 若第一阶段未完整完成（例如用户取消），进行回滚并结束。
+            if not phase1_completed:
+                for temp_path, old_name, _ in reversed(staged_records):
+                    if os.path.exists(temp_path):
+                        os.rename(temp_path, os.path.join(self.rename_dir, old_name))
+                return
+
+            # 第二阶段：从临时名改为目标名。
+            for i, (temp_path, old_name, new_name) in enumerate(staged_records):
+                QApplication.processEvents()
+                if not self.cancel_btn.isEnabled():
+                    self.rename_status_label.setText("重命名已取消")
+                    raise RuntimeError("用户取消操作")
+
+                new_path = os.path.join(self.rename_dir, new_name)
+                if os.path.exists(new_path):
+                    raise FileExistsError(f"目标文件已存在: {new_name}")
+
+                os.rename(temp_path, new_path)
+                rename_operations.append((new_name, old_name))
+                success_count += 1
+                self.progress_bar.setValue(i + 1)
+                self.rename_status_label.setText(f"正在重命名文件... {i+1}/{len(staged_records)}")
+        except Exception as e:
+            # 第二阶段失败时，尽最大努力把仍在临时名状态的文件还原，避免目录半完成状态。
+            for temp_path, old_name, _ in reversed(staged_records):
+                if os.path.exists(temp_path):
+                    try:
+                        os.rename(temp_path, os.path.join(self.rename_dir, old_name))
+                    except Exception:
+                        pass
+
+            error_count = max(1, len(changed_results) - success_count)
+            print(f"批量重命名失败: {str(e)}")
         
         finally:
             # 隐藏进度条和取消按钮
