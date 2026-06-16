@@ -22,6 +22,7 @@ from PyQt6.QtGui import QDrag, QDropEvent, QIcon, QFont, QColor, QTextDocument, 
 from file_matcher import FileMatcher
 
 IGNORED_FILENAMES = {"desktop.ini", "thumbs.db", ".ds_store"}
+RENAME_TEMP_SUFFIX = ".rename_pending"
 
 
 def is_visible_file(directory, filename):
@@ -34,6 +35,9 @@ def is_visible_file(directory, filename):
         return False
 
     if filename.lower() in IGNORED_FILENAMES:
+        return False
+
+    if filename.endswith(RENAME_TEMP_SUFFIX):
         return False
 
     file_path = os.path.join(directory, filename)
@@ -68,6 +72,24 @@ def list_visible_filenames(directory):
     if not directory or not os.path.isdir(directory):
         return []
     return [f for f in os.listdir(directory) if is_visible_file(directory, f)]
+
+
+def ensure_file_visible(file_path):
+    """确保文件在 Windows 资源管理器中可见（清除隐藏/系统属性）。"""
+    if os.name != "nt" or not os.path.exists(file_path):
+        return
+    try:
+        import ctypes
+        file_attr_normal = 0x80
+        ctypes.windll.kernel32.SetFileAttributesW(str(file_path), file_attr_normal)
+    except Exception:
+        pass
+
+
+def make_rename_temp_name(index):
+    """生成不带点前缀的临时文件名，避免被识别为隐藏文件。"""
+    return f"{uuid.uuid4().hex}_{index}{RENAME_TEMP_SUFFIX}"
+
 
 # 创建应用图标
 def create_app_icon():
@@ -1435,6 +1457,8 @@ class FileSelector(QMainWindow):
         
         # 显示进度条和取消按钮
         self.progress_bar.setVisible(True)
+        self.progress_bar.setMaximum(100)
+        self.progress_bar.setFormat("%p%")
         self.progress_bar.setValue(0)
         self.cancel_btn.setVisible(True)
         self.cancel_btn.setEnabled(True)
@@ -1512,7 +1536,36 @@ class FileSelector(QMainWindow):
     def on_rename_progress(self, value, total):
         """更新重命名进度"""
         progress_percent = int(value / total * 100) if total > 0 else 0
+        self.progress_bar.setMaximum(100)
+        self.progress_bar.setFormat("%p%")
         self.progress_bar.setValue(progress_percent)
+        self.rename_status_label.setText(f"正在生成预览... {progress_percent}%")
+
+    def _set_rename_execute_progress(self, step, total_steps, message):
+        """更新执行重命名时的百分比进度。"""
+        progress_percent = min(100, int(step * 100 / total_steps)) if total_steps > 0 else 0
+        self.progress_bar.setMaximum(100)
+        self.progress_bar.setFormat("%p%")
+        self.progress_bar.setValue(progress_percent)
+        self.rename_status_label.setText(f"{message} {progress_percent}%")
+
+    def _refresh_after_rename_execute(self):
+        """重命名完成后刷新界面，避免再次触发 Excel 预览逻辑。"""
+        files = list_visible_filenames(self.rename_dir)
+        self.rename_file_count_label.setText(f"目录文件数: {len(files)}")
+        self.rename_preview_table.setRowCount(len(files))
+        for row, filename in enumerate(files):
+            self.rename_preview_table.setItem(row, 0, QTableWidgetItem(filename))
+            self.rename_preview_table.setItem(row, 1, QTableWidgetItem(filename))
+        self.rename_results = []
+        self.execute_rename_btn.setEnabled(False)
+
+        if self.rename_type_group.checkedId() == 5:
+            self.clear_excel_cache()
+            if files:
+                self.generate_excel_file(files)
+            else:
+                self.excel_status_label.setText("重命名完成，目录中暂无可处理文件")
 
     def on_rename_file_count_ready(self, count):
         """更新重命名文件数量"""
@@ -1585,8 +1638,9 @@ class FileSelector(QMainWindow):
         
         # 显示进度条和取消按钮
         self.progress_bar.setVisible(True)
+        self.progress_bar.setMaximum(100)
+        self.progress_bar.setFormat("%p%")
         self.progress_bar.setValue(0)
-        self.progress_bar.setMaximum(len(changed_results))
         self.cancel_btn.setVisible(True)
         self.cancel_btn.setEnabled(True)
         
@@ -1595,7 +1649,7 @@ class FileSelector(QMainWindow):
         self.execute_rename_btn.setEnabled(False)
         
         # 更新状态
-        self.rename_status_label.setText("正在重命名文件...")
+        self.rename_status_label.setText("正在重命名文件... 0%")
         
         # 执行重命名
         success_count = 0
@@ -1603,6 +1657,7 @@ class FileSelector(QMainWindow):
         rename_operations = []  # 记录重命名操作，用于撤回
         staged_records = []  # 记录阶段一临时重命名，用于冲突安全处理和回滚
         phase1_completed = False
+        total_steps = max(1, len(changed_results) * 2)
         
         try:
             # 第一阶段：全部先改为唯一临时名，彻底释放目标名称，避免互相占用导致失败。
@@ -1617,16 +1672,15 @@ class FileSelector(QMainWindow):
                 if not os.path.exists(old_path):
                     raise FileNotFoundError(f"源文件不存在: {old_name}")
 
-                temp_name = f".rename_tmp_{uuid.uuid4().hex}_{i}"
+                temp_name = make_rename_temp_name(i)
                 temp_path = os.path.join(self.rename_dir, temp_name)
                 while os.path.exists(temp_path):
-                    temp_name = f".rename_tmp_{uuid.uuid4().hex}_{i}"
+                    temp_name = make_rename_temp_name(i)
                     temp_path = os.path.join(self.rename_dir, temp_name)
 
                 os.rename(old_path, temp_path)
                 staged_records.append((temp_path, old_name, new_name))
-                self.progress_bar.setValue(i + 1)
-                self.rename_status_label.setText(f"正在准备重命名... {i+1}/{len(changed_results)}")
+                self._set_rename_execute_progress(i + 1, total_steps, "正在准备重命名")
 
             phase1_completed = len(staged_records) == len(changed_results)
 
@@ -1634,7 +1688,9 @@ class FileSelector(QMainWindow):
             if not phase1_completed:
                 for temp_path, old_name, _ in reversed(staged_records):
                     if os.path.exists(temp_path):
-                        os.rename(temp_path, os.path.join(self.rename_dir, old_name))
+                        restored_path = os.path.join(self.rename_dir, old_name)
+                        os.rename(temp_path, restored_path)
+                        ensure_file_visible(restored_path)
                 return
 
             # 第二阶段：从临时名改为目标名。
@@ -1649,16 +1705,18 @@ class FileSelector(QMainWindow):
                     raise FileExistsError(f"目标文件已存在: {new_name}")
 
                 os.rename(temp_path, new_path)
+                ensure_file_visible(new_path)
                 rename_operations.append((new_name, old_name))
                 success_count += 1
-                self.progress_bar.setValue(i + 1)
-                self.rename_status_label.setText(f"正在重命名文件... {i+1}/{len(staged_records)}")
+                self._set_rename_execute_progress(len(changed_results) + i + 1, total_steps, "正在重命名文件")
         except Exception as e:
             # 第二阶段失败时，尽最大努力把仍在临时名状态的文件还原，避免目录半完成状态。
             for temp_path, old_name, _ in reversed(staged_records):
                 if os.path.exists(temp_path):
                     try:
-                        os.rename(temp_path, os.path.join(self.rename_dir, old_name))
+                        restored_path = os.path.join(self.rename_dir, old_name)
+                        os.rename(temp_path, restored_path)
+                        ensure_file_visible(restored_path)
                     except Exception:
                         pass
 
@@ -1676,19 +1734,13 @@ class FileSelector(QMainWindow):
             # 更新状态
             self.rename_status_label.setText(f"重命名完成: 成功 {success_count} 个，失败 {error_count} 个")
             
-            # 更新文件列表
-            self.update_rename_file_count()
-            
-            # 清空结果
-            self.rename_results = []
-            
             # 如果有成功的重命名，保存到历史记录并启用撤回按钮
             if success_count > 0:
                 self.rename_history.append(rename_operations)
                 self.undo_rename_btn.setEnabled(True)
-                # 重新预览
-                self.preview_rename()
+                self._refresh_after_rename_execute()
             else:
+                self.update_rename_file_count()
                 self.execute_rename_btn.setEnabled(False)
             
             QMessageBox.information(self, "完成", f"重命名完成: 成功 {success_count} 个，失败 {error_count} 个")
@@ -1772,12 +1824,9 @@ class FileSelector(QMainWindow):
             # 更新状态
             self.rename_status_label.setText(f"撤回完成: 成功 {success_count} 个，失败 {error_count} 个")
             
-            # 更新文件列表
-            self.update_rename_file_count()
-            
-            # 如果有成功的撤回，重新预览
+            # 如果有成功的撤回，刷新当前文件列表
             if success_count > 0:
-                self.preview_rename()
+                self._refresh_after_rename_execute()
             
             QMessageBox.information(self, "完成", f"撤回完成: 成功 {success_count} 个，失败 {error_count} 个")
 
