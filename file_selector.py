@@ -91,6 +91,58 @@ def make_rename_temp_name(index):
     return f"{uuid.uuid4().hex}_{index}{RENAME_TEMP_SUFFIX}"
 
 
+def normalize_filename(name):
+    """统一文件名比较规则，Windows 下忽略大小写。"""
+    return name.casefold() if os.name == "nt" else name
+
+
+def simulate_two_phase_rename(directory, results):
+    """
+    模拟两阶段重命名，判断计划是否可执行。
+    可正确处理互换名称、链式重命名等场景，避免误报重名。
+    """
+    rename_map = {old: new for old, new in results if old != new}
+    if not rename_map:
+        return True, ""
+
+    if not directory or not os.path.isdir(directory):
+        return False, "重命名目录无效"
+
+    target_sources = {}
+    for old_name, new_name in rename_map.items():
+        target_sources.setdefault(normalize_filename(new_name), []).append(old_name)
+
+    for sources in target_sources.values():
+        if len(sources) <= 1:
+            continue
+        display_target = rename_map[sources[0]]
+        source_list = "、".join(f"\"{name}\"" for name in sources)
+        return False, f"{source_list} 都将重命名为 \"{display_target}\""
+
+    visible_files = list_visible_filenames(directory)
+    occupied = {normalize_filename(name): name for name in visible_files}
+
+    # 第一阶段：待重命名文件先离开原路径。
+    for old_name in rename_map:
+        old_key = normalize_filename(old_name)
+        if old_key not in occupied:
+            return False, f"源文件不存在: {old_name}"
+        del occupied[old_key]
+
+    # 第二阶段：依次写入目标名称。
+    for old_name, new_name in rename_map.items():
+        target_key = normalize_filename(new_name)
+        if target_key in occupied:
+            blocker = occupied[target_key]
+            return False, (
+                f"\"{old_name}\" 无法重命名为 \"{new_name}\"，"
+                f"目标名称已被 \"{blocker}\" 占用"
+            )
+        occupied[target_key] = new_name
+
+    return True, ""
+
+
 # 创建应用图标
 def create_app_icon():
     # 创建一个64x64的图标
@@ -1598,10 +1650,14 @@ class FileSelector(QMainWindow):
         self.preview_rename_btn.setEnabled(True)
         self.execute_rename_btn.setEnabled(True)
         
-        # 检查是否有重名文件
-        new_names = [new_name for _, new_name in results]
-        if len(new_names) != len(set(new_names)):
-            QMessageBox.warning(self, "警告", "检测到重命名后存在重复的文件名，请修改重命名规则")
+        # 检查重命名计划是否可执行（支持互换/链式重命名，避免误报）
+        can_rename, conflict_message = simulate_two_phase_rename(self.rename_dir, results)
+        if not can_rename:
+            QMessageBox.warning(
+                self,
+                "警告",
+                f"检测到重命名冲突，请修改重命名规则：\n{conflict_message}"
+            )
             self.execute_rename_btn.setEnabled(False)
 
     def on_rename_error(self, msg):
@@ -1628,6 +1684,11 @@ class FileSelector(QMainWindow):
         if not changed_results:
             QMessageBox.information(self, "提示", "没有检测到需要重命名的文件")
             self.execute_rename_btn.setEnabled(False)
+            return
+
+        can_rename, conflict_message = simulate_two_phase_rename(self.rename_dir, self.rename_results)
+        if not can_rename:
+            QMessageBox.warning(self, "警告", f"检测到重命名冲突，无法执行：\n{conflict_message}")
             return
         
         reply = QMessageBox.question(self, "确认操作", 
@@ -1701,7 +1762,7 @@ class FileSelector(QMainWindow):
                     raise RuntimeError("用户取消操作")
 
                 new_path = os.path.join(self.rename_dir, new_name)
-                if os.path.exists(new_path):
+                if os.path.exists(new_path) and normalize_filename(os.path.basename(new_path)) != normalize_filename(old_name):
                     raise FileExistsError(f"目标文件已存在: {new_name}")
 
                 os.rename(temp_path, new_path)
