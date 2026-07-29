@@ -143,6 +143,30 @@ def simulate_two_phase_rename(directory, results):
     return True, ""
 
 
+def _needs_two_phase_rename(rename_map):
+    """检测是否存在需要两阶段重命名的冲突场景。
+
+    当某个文件的目标名称恰好也是另一个待重命名文件的源名称时，
+    直接重命名会因顺序问题导致文件覆盖或丢失。典型场景：
+      - 互换：A→B 且 B→A
+      - 链式：A→B 且 B→C
+
+    返回 True 表示存在冲突，必须使用两阶段（临时名中转）；
+    返回 False 表示可以直接重命名（每个文件一步到位）。
+    """
+    if len(rename_map) <= 1:
+        return False
+
+    # 收集所有目标文件名（规范化后），看是否与任何源文件名重叠
+    target_names = {normalize_filename(new_name) for new_name in rename_map.values()}
+
+    for old_name in rename_map:
+        if normalize_filename(old_name) in target_names:
+            return True
+
+    return False
+
+
 # 创建应用图标
 def create_app_icon():
     # 创建一个64x64的图标
@@ -753,7 +777,7 @@ class FileSelector(QMainWindow):
         self.setWindowIcon(create_app_icon())
 
     def init_ui(self):
-        self.setWindowTitle("文件处理工具 v2.4        *使用遇到bug或有功能建议请及时联系王永皓")
+        self.setWindowTitle("文件处理工具 v2.5")
         self.setGeometry(300, 300, 1000, 800)
         central_widget = QWidget()
         self.setCentralWidget(central_widget)
@@ -1673,14 +1697,19 @@ class FileSelector(QMainWindow):
         
         QMessageBox.critical(self, "错误", f"重命名时出错: {msg}")
 
+    # ───────────────── 重命名执行相关常量 ─────────────────
+    # UI 节流：避免每处理一个文件都刷新界面，大幅减少 GUI 线程开销。
+    _PROCESS_EVENTS_INTERVAL = 20   # 每 N 个文件调用一次 processEvents
+    _PROGRESS_UPDATE_INTERVAL = 50  # 每 N 个文件更新一次进度条
+
     def execute_rename(self):
-        """执行重命名操作"""
+        """执行重命名操作（自动选择最优策略）"""
         if not self.rename_results:
             QMessageBox.warning(self, "警告", "请先预览重命名结果")
             return
 
-        # 仅处理实际发生变化的记录，避免无意义重命名。
-        changed_results = [(old_name, new_name) for old_name, new_name in self.rename_results if old_name != new_name]
+        # 仅处理实际发生变化的记录
+        changed_results = [(o, n) for o, n in self.rename_results if o != n]
         if not changed_results:
             QMessageBox.information(self, "提示", "没有检测到需要重命名的文件")
             self.execute_rename_btn.setEnabled(False)
@@ -1690,13 +1719,13 @@ class FileSelector(QMainWindow):
         if not can_rename:
             QMessageBox.warning(self, "警告", f"检测到重命名冲突，无法执行：\n{conflict_message}")
             return
-        
-        reply = QMessageBox.question(self, "确认操作", 
+
+        reply = QMessageBox.question(self, "确认操作",
                                      f"确定要重命名 {len(changed_results)} 个文件吗？",
                                      QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
         if reply != QMessageBox.StandardButton.Yes:
             return
-        
+
         # 显示进度条和取消按钮
         self.progress_bar.setVisible(True)
         self.progress_bar.setMaximum(100)
@@ -1704,30 +1733,92 @@ class FileSelector(QMainWindow):
         self.progress_bar.setValue(0)
         self.cancel_btn.setVisible(True)
         self.cancel_btn.setEnabled(True)
-        
+
         # 禁用按钮
         self.preview_rename_btn.setEnabled(False)
         self.execute_rename_btn.setEnabled(False)
-        
-        # 更新状态
-        self.rename_status_label.setText("正在重命名文件... 0%")
-        
-        # 执行重命名
+
+        # 智能选择重命名策略
+        rename_map = {old: new for old, new in changed_results}
+        use_two_phase = _needs_two_phase_rename(rename_map)
+
+        if use_two_phase:
+            self.rename_status_label.setText("检测到名称冲突，使用安全重命名策略...")
+        else:
+            self.rename_status_label.setText("正在重命名文件... 0%")
+
+        if use_two_phase:
+            self._execute_two_phase_rename(changed_results)
+        else:
+            self._execute_direct_rename(changed_results)
+
+    def _execute_direct_rename(self, changed_results):
+        """直接重命名（快路径）：无名称冲突时每个文件一步到位。"""
         success_count = 0
         error_count = 0
-        rename_operations = []  # 记录重命名操作，用于撤回
-        staged_records = []  # 记录阶段一临时重命名，用于冲突安全处理和回滚
-        phase1_completed = False
-        total_steps = max(1, len(changed_results) * 2)
-        
+        rename_operations = []
+        total = len(changed_results)
+        last_progress_pct = -1
+
         try:
-            # 第一阶段：全部先改为唯一临时名，彻底释放目标名称，避免互相占用导致失败。
             for i, (old_name, new_name) in enumerate(changed_results):
-                # 检查取消状态
-                QApplication.processEvents()
-                if not self.cancel_btn.isEnabled():
-                    self.rename_status_label.setText("重命名已取消")
-                    break
+                # 节流：事件循环和进度更新
+                if i % self._PROCESS_EVENTS_INTERVAL == 0:
+                    QApplication.processEvents()
+                    if not self.cancel_btn.isEnabled():
+                        self.rename_status_label.setText("重命名已取消")
+                        break
+
+                old_path = os.path.join(self.rename_dir, old_name)
+                new_path = os.path.join(self.rename_dir, new_name)
+
+                if not os.path.exists(old_path):
+                    error_count += 1
+                    print(f"源文件不存在: {old_name}")
+                    continue
+
+                if os.path.exists(new_path) and normalize_filename(new_name) != normalize_filename(old_name):
+                    error_count += 1
+                    print(f"目标文件已存在: {new_name}")
+                    continue
+
+                try:
+                    os.rename(old_path, new_path)
+                    ensure_file_visible(new_path)
+                    rename_operations.append((new_name, old_name))
+                    success_count += 1
+                except OSError as e:
+                    error_count += 1
+                    print(f"重命名失败 {old_name} → {new_name}: {e}")
+
+                # 节流：进度条更新
+                current_pct = (i + 1) * 100 // total
+                if current_pct != last_progress_pct:
+                    last_progress_pct = current_pct
+                    self._set_rename_execute_progress(i + 1, total, "正在重命名文件")
+
+        finally:
+            self._finish_rename(success_count, error_count, rename_operations, total)
+
+    def _execute_two_phase_rename(self, changed_results):
+        """两阶段重命名（安全路径）：先改为临时名再改为目标名，处理名称冲突。"""
+        success_count = 0
+        error_count = 0
+        rename_operations = []
+        staged_records = []
+        phase1_completed = False
+        total = len(changed_results)
+        total_steps = max(1, total * 2)
+        last_progress_step = 0
+
+        try:
+            # ── 第一阶段：全部先改为唯一临时名 ──
+            for i, (old_name, new_name) in enumerate(changed_results):
+                if i % self._PROCESS_EVENTS_INTERVAL == 0:
+                    QApplication.processEvents()
+                    if not self.cancel_btn.isEnabled():
+                        self.rename_status_label.setText("重命名已取消")
+                        break
 
                 old_path = os.path.join(self.rename_dir, old_name)
                 if not os.path.exists(old_path):
@@ -1741,11 +1832,16 @@ class FileSelector(QMainWindow):
 
                 os.rename(old_path, temp_path)
                 staged_records.append((temp_path, old_name, new_name))
-                self._set_rename_execute_progress(i + 1, total_steps, "正在准备重命名")
 
-            phase1_completed = len(staged_records) == len(changed_results)
+                # 节流：进度更新
+                step = i + 1
+                if step - last_progress_step >= self._PROGRESS_UPDATE_INTERVAL or step == total:
+                    last_progress_step = step
+                    self._set_rename_execute_progress(step, total_steps, "正在准备重命名")
 
-            # 若第一阶段未完整完成（例如用户取消），进行回滚并结束。
+            phase1_completed = len(staged_records) == total
+
+            # 第一阶段未完整完成 → 回滚
             if not phase1_completed:
                 for temp_path, old_name, _ in reversed(staged_records):
                     if os.path.exists(temp_path):
@@ -1754,12 +1850,14 @@ class FileSelector(QMainWindow):
                         ensure_file_visible(restored_path)
                 return
 
-            # 第二阶段：从临时名改为目标名。
+            # ── 第二阶段：从临时名改为目标名 ──
+            last_progress_step = 0
             for i, (temp_path, old_name, new_name) in enumerate(staged_records):
-                QApplication.processEvents()
-                if not self.cancel_btn.isEnabled():
-                    self.rename_status_label.setText("重命名已取消")
-                    raise RuntimeError("用户取消操作")
+                if i % self._PROCESS_EVENTS_INTERVAL == 0:
+                    QApplication.processEvents()
+                    if not self.cancel_btn.isEnabled():
+                        self.rename_status_label.setText("重命名已取消")
+                        raise RuntimeError("用户取消操作")
 
                 new_path = os.path.join(self.rename_dir, new_name)
                 if os.path.exists(new_path) and normalize_filename(os.path.basename(new_path)) != normalize_filename(old_name):
@@ -1769,9 +1867,14 @@ class FileSelector(QMainWindow):
                 ensure_file_visible(new_path)
                 rename_operations.append((new_name, old_name))
                 success_count += 1
-                self._set_rename_execute_progress(len(changed_results) + i + 1, total_steps, "正在重命名文件")
+
+                step = total + i + 1
+                if step - last_progress_step >= self._PROGRESS_UPDATE_INTERVAL or step == total_steps:
+                    last_progress_step = step
+                    self._set_rename_execute_progress(step, total_steps, "正在重命名文件")
+
         except Exception as e:
-            # 第二阶段失败时，尽最大努力把仍在临时名状态的文件还原，避免目录半完成状态。
+            # 尽最大努力还原仍在临时名状态的文件
             for temp_path, old_name, _ in reversed(staged_records):
                 if os.path.exists(temp_path):
                     try:
@@ -1781,30 +1884,29 @@ class FileSelector(QMainWindow):
                     except Exception:
                         pass
 
-            error_count = max(1, len(changed_results) - success_count)
+            error_count = max(1, total - success_count)
             print(f"批量重命名失败: {str(e)}")
-        
+
         finally:
-            # 隐藏进度条和取消按钮
-            self.progress_bar.setVisible(False)
-            self.cancel_btn.setVisible(False)
-            
-            # 启用按钮
-            self.preview_rename_btn.setEnabled(True)
-            
-            # 更新状态
-            self.rename_status_label.setText(f"重命名完成: 成功 {success_count} 个，失败 {error_count} 个")
-            
-            # 如果有成功的重命名，保存到历史记录并启用撤回按钮
-            if success_count > 0:
-                self.rename_history.append(rename_operations)
-                self.undo_rename_btn.setEnabled(True)
-                self._refresh_after_rename_execute()
-            else:
-                self.update_rename_file_count()
-                self.execute_rename_btn.setEnabled(False)
-            
-            QMessageBox.information(self, "完成", f"重命名完成: 成功 {success_count} 个，失败 {error_count} 个")
+            self._finish_rename(success_count, error_count, rename_operations, total)
+
+    def _finish_rename(self, success_count, error_count, rename_operations, total):
+        """重命名完成后的统一收尾：隐藏进度条、更新状态、记录历史。"""
+        self.progress_bar.setVisible(False)
+        self.cancel_btn.setVisible(False)
+        self.preview_rename_btn.setEnabled(True)
+
+        self.rename_status_label.setText(f"重命名完成: 成功 {success_count} 个，失败 {error_count} 个")
+
+        if success_count > 0:
+            self.rename_history.append(rename_operations)
+            self.undo_rename_btn.setEnabled(True)
+            self._refresh_after_rename_execute()
+        else:
+            self.update_rename_file_count()
+            self.execute_rename_btn.setEnabled(False)
+
+        QMessageBox.information(self, "完成", f"重命名完成: 成功 {success_count} 个，失败 {error_count} 个")
 
     def undo_rename(self):
         """撤回重命名操作"""
