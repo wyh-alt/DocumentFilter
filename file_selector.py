@@ -60,18 +60,54 @@ def is_visible_file(directory, filename):
     return True
 
 
+def _scan_visible_names(directory):
+    """使用 os.scandir 一次枚举目录，返回可见文件名列表。
+
+    Windows 下 scandir 直接从目录枚举数据中读取文件属性，无需对每个
+    文件额外发起 isfile / GetFileAttributesW 系统调用，大目录扫描比
+    listdir + 逐文件检查快约 20~30 倍。
+    """
+    if not directory or not os.path.isdir(directory):
+        return []
+    visible = []
+    try:
+        with os.scandir(directory) as it:
+            for entry in it:
+                name = entry.name
+                if not name or name.startswith("."):
+                    continue
+                if name.lower() in IGNORED_FILENAMES:
+                    continue
+                if name.endswith(RENAME_TEMP_SUFFIX):
+                    continue
+                if not entry.is_file():
+                    continue
+                if os.name == "nt":
+                    try:
+                        attrs = entry.stat().st_file_attributes
+                        if attrs & (0x2 | 0x4):  # hidden | system
+                            continue
+                    except (AttributeError, OSError):
+                        # 属性读取失败时回退到仅文件名过滤，避免阻断主流程
+                        pass
+                visible.append(name)
+    except OSError:
+        return []
+    return visible
+
+
 def list_visible_files(directory):
     """返回目录中可参与处理的文件完整路径列表。"""
     if not directory or not os.path.isdir(directory):
         return []
-    return [os.path.join(directory, f) for f in os.listdir(directory) if is_visible_file(directory, f)]
+    return [os.path.join(directory, f) for f in _scan_visible_names(directory)]
 
 
 def list_visible_filenames(directory):
     """返回目录中可参与处理的文件名列表。"""
     if not directory or not os.path.isdir(directory):
         return []
-    return [f for f in os.listdir(directory) if is_visible_file(directory, f)]
+    return _scan_visible_names(directory)
 
 
 def ensure_file_visible(file_path):
@@ -254,22 +290,6 @@ class HTMLDelegate(QStyledItemDelegate):
                 return
         super().paint(painter, option, index)
 
-# 自定义复选框容器，用于在表格中显示复选框
-class CheckBoxWidget(QWidget):
-    def __init__(self, parent=None):
-        super().__init__(parent)
-        layout = QHBoxLayout(self)
-        layout.setContentsMargins(3, 1, 3, 1)
-        layout.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.checkbox = QCheckBox()
-        layout.addWidget(self.checkbox)
-        
-    def isChecked(self):
-        return self.checkbox.isChecked()
-    
-    def setChecked(self, checked):
-        self.checkbox.setChecked(checked)
-
 class MatchWorker(QThread):
     result_ready = pyqtSignal(list, int)
     error = pyqtSignal(str)
@@ -354,44 +374,46 @@ class MatchWorker(QThread):
     
     def run(self):
         try:
-            # 首先统计文件数量并发送信号
-            source_count = 0
-            target_count = 0
-            
-            # 使用更高效的方式统计文件数量
-            if self.source_dir and os.path.isdir(self.source_dir):
-                source_count = len(list_visible_files(self.source_dir))
-            
-            if self.target_dir and os.path.isdir(self.target_dir):
-                target_count = len(list_visible_files(self.target_dir))
-            
-            # 发送文件数量信号
-            self.file_counts_ready.emit(source_count, target_count)
-            
-            # 检查是否已取消
-            if self._is_cancelled:
-                return
-            
-            matched_pairs = []
-            unmatched_source_files = []  # 未匹配的源文件
-            unmatched_keywords = []      # 未匹配的检索文本
-            
+            # 一次性加载文件列表：数量统计与后续匹配共用同一份数据，避免重复扫描目录
+            source_files = []
+            target_files = []
             if self.match_method_index == 0:  # 根据源目录匹配提取
                 if not self.source_dir or not self.target_dir:
                     self.error.emit("请先选择源目录和目标目录")
                     return
-                
-                # 优化1: 延迟加载文件列表
                 self.progress.emit(0, 100)
                 source_files = self._load_files(self.source_dir)
                 if self._is_cancelled:
                     return
-                
                 self.progress.emit(10, 100)
                 target_files = self._load_files(self.target_dir)
                 if self._is_cancelled:
                     return
-                
+            elif self.match_method_index == 1:  # 根据文本匹配提取
+                if not self.target_dir:
+                    self.error.emit("请先选择目标目录")
+                    return
+                filter_text = self.text_input.strip()
+                if not filter_text:
+                    self.error.emit("请输入检索文本")
+                    return
+                self.progress.emit(0, 100)
+                target_files = self._load_files(self.target_dir)
+                if self._is_cancelled:
+                    return
+
+            # 发送文件数量信号（复用已加载的文件列表，无需二次扫描）
+            self.file_counts_ready.emit(len(source_files), len(target_files))
+
+            # 检查是否已取消
+            if self._is_cancelled:
+                return
+
+            matched_pairs = []
+            unmatched_source_files = []  # 未匹配的源文件
+            unmatched_keywords = []      # 未匹配的检索文本
+
+            if self.match_method_index == 0:  # 根据源目录匹配提取
                 self.progress.emit(20, 100)
                 
                 # 优化2: 预处理目标文件，创建查找索引
@@ -540,27 +562,12 @@ class MatchWorker(QThread):
                 unmatched_source_files = [s for s in source_files if s not in matched_source_files]
             
             elif self.match_method_index == 1:  # 根据文本匹配提取
-                if not self.target_dir:
-                    self.error.emit("请先选择目标目录")
-                    return
-                
-                filter_text = self.text_input.strip()
-                if not filter_text:
-                    self.error.emit("请输入检索文本")
-                    return
-                
                 # 获取匹配依据选项
                 text_match_basis = self.text_match_basis
-                
+
                 # 处理多行或分号分隔的关键字
                 keywords = [kw.strip() for kw in filter_text.replace(';', '\n').split('\n') if kw.strip()]
-                
-                # 优化4: 创建关键字集合，提高查找速度
-                keywords_set = set(keywords)
-                
-                # 获取所有目标文件
-                target_files = list_visible_files(self.target_dir)
-                
+
                 # 优化5: 根据匹配模式预处理文件名
                 if text_match_basis == 0:  # 完全匹配
                     # 创建不含扩展名的文件名字典
@@ -927,7 +934,7 @@ class FileSelector(QMainWindow):
         self.setWindowIcon(create_app_icon())
 
     def init_ui(self):
-        self.setWindowTitle("文件处理工具 v2.5.1")
+        self.setWindowTitle("文件处理工具 v2.6")
         self.setGeometry(300, 300, 1000, 800)
         central_widget = QWidget()
         self.setCentralWidget(central_widget)
@@ -2202,10 +2209,11 @@ class FileSelector(QMainWindow):
         # 首先显示未匹配的文件（红色字体）
         if hasattr(self, 'unmatched_source_files') and self.unmatched_source_files:
             for unmatched_file in self.unmatched_source_files:
-                # 复选框
-                checkbox_widget = CheckBoxWidget()
-                checkbox_widget.setChecked(False)  # 未匹配的文件默认不选中
-                self.result_table.setCellWidget(current_row, 0, checkbox_widget)
+                # 复选框（未匹配的文件默认不选中）
+                check_item = QTableWidgetItem()
+                check_item.setFlags(check_item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
+                check_item.setCheckState(Qt.CheckState.Unchecked)
+                self.result_table.setItem(current_row, 0, check_item)
                 
                 # 源文件列（红色字体）
                 source_item = QTableWidgetItem(os.path.basename(unmatched_file))
@@ -2223,10 +2231,11 @@ class FileSelector(QMainWindow):
         # 显示未匹配的关键字（红色字体）
         if hasattr(self, 'unmatched_keywords') and self.unmatched_keywords:
             for unmatched_keyword in self.unmatched_keywords:
-                # 复选框
-                checkbox_widget = CheckBoxWidget()
-                checkbox_widget.setChecked(False)  # 未匹配的关键字默认不选中
-                self.result_table.setCellWidget(current_row, 0, checkbox_widget)
+                # 复选框（未匹配的关键字默认不选中）
+                check_item = QTableWidgetItem()
+                check_item.setFlags(check_item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
+                check_item.setCheckState(Qt.CheckState.Unchecked)
+                self.result_table.setItem(current_row, 0, check_item)
                 
                 # 检索文本列（红色字体）
                 keyword_item = QTableWidgetItem(unmatched_keyword)
@@ -2243,10 +2252,11 @@ class FileSelector(QMainWindow):
         
         # 然后显示匹配的文件
         for s, t, s_name, t_name, key in matched_pairs:
-            # 复选框
-            checkbox_widget = CheckBoxWidget()
-            checkbox_widget.setChecked(True)
-            self.result_table.setCellWidget(current_row, 0, checkbox_widget)
+            # 复选框（匹配的文件默认选中）
+            check_item = QTableWidgetItem()
+            check_item.setFlags(check_item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
+            check_item.setCheckState(Qt.CheckState.Checked)
+            self.result_table.setItem(current_row, 0, check_item)
             
             # 源文件列或检索文本列
             if s:
@@ -2298,21 +2308,24 @@ class FileSelector(QMainWindow):
 
     def select_all_files(self):
         for row in range(self.result_table.rowCount()):
-            checkbox_widget = self.result_table.cellWidget(row, 0)
-            if checkbox_widget:
-                checkbox_widget.setChecked(True)
+            check_item = self.result_table.item(row, 0)
+            if check_item:
+                check_item.setCheckState(Qt.CheckState.Checked)
 
     def deselect_all_files(self):
         for row in range(self.result_table.rowCount()):
-            checkbox_widget = self.result_table.cellWidget(row, 0)
-            if checkbox_widget:
-                checkbox_widget.setChecked(False)
+            check_item = self.result_table.item(row, 0)
+            if check_item:
+                check_item.setCheckState(Qt.CheckState.Unchecked)
 
     def invert_selection(self):
         for row in range(self.result_table.rowCount()):
-            checkbox_widget = self.result_table.cellWidget(row, 0)
-            if checkbox_widget:
-                checkbox_widget.setChecked(not checkbox_widget.isChecked())
+            check_item = self.result_table.item(row, 0)
+            if check_item:
+                check_item.setCheckState(
+                    Qt.CheckState.Unchecked if check_item.checkState() == Qt.CheckState.Checked
+                    else Qt.CheckState.Checked
+                )
 
     def export_result_table_to_excel(self):
         """将右侧匹配结果表格导出为 Excel，仅包含源文件、目标文件列及红色未匹配样式"""
@@ -2376,8 +2389,8 @@ class FileSelector(QMainWindow):
         # 获取选中的文件
         selected_files = []
         for row in range(self.result_table.rowCount()):
-            checkbox_widget = self.result_table.cellWidget(row, 0)
-            if checkbox_widget and checkbox_widget.isChecked():
+            check_item = self.result_table.item(row, 0)
+            if check_item and check_item.checkState() == Qt.CheckState.Checked:
                 selected_files.append(self.matched_files[row])
         
         if not selected_files:
@@ -2465,10 +2478,19 @@ class FileSelector(QMainWindow):
                 QMessageBox.information(self, "已取消", f"操作已取消: 成功{operation_desc[operation]}{processed}个文件，失败{failed}个文件")
             else:
                 self.status_label.setText(f"{operation_desc[operation]}完成: 成功 {processed} 个文件, 失败 {failed} 个文件")
-                QMessageBox.information(self, "完成", f"操作完成: 成功{operation_desc[operation]}{processed}个文件，失败{failed}个文件")
-            
-            if operation in ["move", "delete"] and processed > 0:
-                self.match_files()
+                if operation in ["move", "delete"] and processed > 0:
+                    # 文件系统已变化，询问用户是否重新匹配以刷新结果（默认否，避免自动重跑）
+                    reply = QMessageBox.question(
+                        self,
+                        "完成",
+                        f"操作完成: 成功{operation_desc[operation]}{processed}个文件，失败{failed}个文件。\n\n是否重新匹配筛选，刷新匹配结果？",
+                        QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                        QMessageBox.StandardButton.No
+                    )
+                    if reply == QMessageBox.StandardButton.Yes:
+                        self.match_files()
+                else:
+                    QMessageBox.information(self, "完成", f"操作完成: 成功{operation_desc[operation]}{processed}个文件，失败{failed}个文件")
 
     def on_file_counts_ready(self, source_count, target_count):
         """更新文件数量统计"""
