@@ -8,21 +8,22 @@ import shutil
 import concurrent.futures
 import tempfile
 import uuid
-import pandas as pd
-from openpyxl import Workbook
-from openpyxl.styles import Font, Alignment
-from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, 
+# 注意：pandas / openpyxl 为重量级依赖，不在模块顶层导入，
+# 由 main 入口延迟加载并配合启动页显示加载状态（见文件末尾的
+# __main__ 块），相关函数内部各自延迟导入（加载后命中模块缓存）。
+from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
                            QListWidget, QListWidgetItem, QPushButton, QFileDialog, QLabel,
                            QCheckBox, QMessageBox, QProgressBar, QComboBox, QGroupBox,
                            QLineEdit, QSplitter, QFrame, QTextEdit, QTableWidget, QTableWidgetItem, QHeaderView,
                            QStyledItemDelegate, QTabWidget, QRadioButton, QButtonGroup, QSizePolicy)
 from PyQt6.QtCore import Qt, QMimeData, QUrl, QThread, pyqtSignal, QTimer
-from PyQt6.QtGui import QDrag, QDropEvent, QIcon, QFont, QColor, QTextDocument, QAbstractTextDocumentLayout, QPainter, QPixmap
+from PyQt6.QtGui import QDrag, QDropEvent, QIcon, QColor, QTextDocument, QAbstractTextDocumentLayout, QPainter, QPixmap
 
 from file_matcher import FileMatcher
 
 IGNORED_FILENAMES = {"desktop.ini", "thumbs.db", ".ds_store"}
 RENAME_TEMP_SUFFIX = ".rename_pending"
+APP_VERSION = "3.0"
 
 
 def is_visible_file(directory, filename):
@@ -209,22 +210,22 @@ def create_app_icon():
     icon_size = 64
     pixmap = QPixmap(icon_size, icon_size)
     pixmap.fill(Qt.GlobalColor.transparent)
-    
+
     painter = QPainter(pixmap)
     painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
-    
+
     # 绘制文件夹图标背景
     painter.setPen(Qt.PenStyle.NoPen)
     painter.setBrush(QColor(65, 105, 225))  # 蓝色
     painter.drawRoundedRect(4, 12, 56, 44, 5, 5)
-    
+
     # 绘制文件夹顶部
     painter.setBrush(QColor(100, 149, 237))  # 浅蓝色
     painter.drawRoundedRect(4, 4, 36, 16, 3, 3)
-    
+
     # 绘制筛选/过滤图标
     painter.setBrush(QColor(255, 255, 255))  # 白色
-    
+
     # 绘制漏斗形状
     points = [
         (24, 20),  # 顶部中心
@@ -235,21 +236,21 @@ def create_app_icon():
         (30, 35),  # 中部左侧
         (18, 20)   # 顶部左侧
     ]
-    
+
     # 将点列表转换为Qt可用的多边形
     from PyQt6.QtCore import QPoint
     polygon = [QPoint(x, y) for x, y in points]
-    
+
     # 绘制漏斗
     painter.drawPolygon(polygon)
-    
+
     # 绘制文件图标
     painter.setBrush(QColor(255, 255, 255))  # 白色
     painter.drawRect(42, 28, 12, 16)  # 文件主体
     painter.drawRect(44, 32, 8, 2)    # 文件行1
     painter.drawRect(44, 36, 8, 2)    # 文件行2
     painter.drawRect(44, 40, 8, 2)    # 文件行3
-    
+
     painter.end()
     return QIcon(pixmap)
 
@@ -290,11 +291,39 @@ class HTMLDelegate(QStyledItemDelegate):
                 return
         super().paint(painter, option, index)
 
+class PasteTextEdit(QTextEdit):
+    """优化大段文本粘贴体验（滚动到顶部 + 去除末尾空行）。
+
+    1. 粘贴后滚动到顶部：QTextEdit 粘贴后光标跳到插入内容末尾，视图
+       随之自动滚到文末显示空白页，用户会误以为粘贴失败而反复粘贴。
+       这里在 Qt 内部完成光标跟随滚动后，再滚回顶部显示已粘贴内容。
+    2. 去除末尾换行：多行文本以换行结尾时，QTextDocument 会生成一个
+       末尾空块，滚动条范围随之覆盖空行区域，滚到底部时视口显示的是
+       空行而不是最后一行数据。去除末尾换行后，滚动到底时最后一行
+       数据正好位于视口底部。
+    """
+
+    def insertFromMimeData(self, source):
+        # 仅去除末尾的换行符（保留开头与中间的换行），避免产生末尾空块。
+        # 该输入框为纯文本关键字输入，无需保留富文本格式。
+        if source.hasText():
+            stripped = source.text().rstrip('\r\n')
+            if stripped != source.text():
+                source = QMimeData()
+                source.setText(stripped)
+        super().insertFromMimeData(source)
+        # 延迟到事件循环下一次处理，确保 Qt 内部滚动完成后才覆盖
+        QTimer.singleShot(0, self._scroll_to_top)
+
+    def _scroll_to_top(self):
+        scrollbar = self.verticalScrollBar()
+        scrollbar.setValue(scrollbar.minimum())
+
 class MatchWorker(QThread):
     result_ready = pyqtSignal(list, int)
     error = pyqtSignal(str)
     progress = pyqtSignal(int, int)
-    file_counts_ready = pyqtSignal(int, int)  # 新增信号：源目录和目标目录文件数量
+    file_counts_ready = pyqtSignal(int, int)  # 新增信号：匹配目录和检索目录文件数量
     unmatched_ready = pyqtSignal(list, list)  # 新增信号：未匹配的源文件和检索文本
     def __init__(self, match_method_index, source_dir, target_dir, match_basis, format_match, text_input, text_match_basis=0, expand_search=False, use_multithreading=True):
         super().__init__()
@@ -377,9 +406,9 @@ class MatchWorker(QThread):
             # 一次性加载文件列表：数量统计与后续匹配共用同一份数据，避免重复扫描目录
             source_files = []
             target_files = []
-            if self.match_method_index == 0:  # 根据源目录匹配提取
+            if self.match_method_index == 0:  # 根据其他目录文件匹配提取
                 if not self.source_dir or not self.target_dir:
-                    self.error.emit("请先选择源目录和目标目录")
+                    self.error.emit("请先选择匹配目录和检索目录")
                     return
                 self.progress.emit(0, 100)
                 source_files = self._load_files(self.source_dir)
@@ -391,7 +420,7 @@ class MatchWorker(QThread):
                     return
             elif self.match_method_index == 1:  # 根据文本匹配提取
                 if not self.target_dir:
-                    self.error.emit("请先选择目标目录")
+                    self.error.emit("请先选择检索目录")
                     return
                 filter_text = self.text_input.strip()
                 if not filter_text:
@@ -413,7 +442,7 @@ class MatchWorker(QThread):
             unmatched_source_files = []  # 未匹配的源文件
             unmatched_keywords = []      # 未匹配的检索文本
 
-            if self.match_method_index == 0:  # 根据源目录匹配提取
+            if self.match_method_index == 0:  # 根据其他目录文件匹配提取
                 self.progress.emit(20, 100)
                 
                 # 优化2: 预处理目标文件，创建查找索引
@@ -569,14 +598,14 @@ class MatchWorker(QThread):
                 keywords = [kw.strip() for kw in filter_text.replace(';', '\n').split('\n') if kw.strip()]
 
                 # 优化5: 根据匹配模式预处理文件名
-                if text_match_basis == 0:  # 完全匹配
-                    # 创建不含扩展名的文件名字典
+                if text_match_basis == 1:  # 完全匹配（含扩展名的完整文件名）
+                    # 创建完整文件名（含扩展名）字典：检索文本 12345-音频.mp3
+                    # 只能精确匹配 12345-音频.mp3，不会匹配 12345-音频.wav。
                     name_dict = {}
                     for t in target_files:
                         t_name = os.path.basename(t)
-                        t_name_no_ext = os.path.splitext(t_name)[0]
-                        name_dict[t_name_no_ext] = (t, t_name)
-                    
+                        name_dict[t_name] = (t, t_name)
+
                     # 直接查找匹配项
                     matched_keywords = set()
                     for kw in keywords:
@@ -584,10 +613,10 @@ class MatchWorker(QThread):
                             t, t_name = name_dict[kw]
                             matched_pairs.append((None, t, '', t_name, kw))
                             matched_keywords.add(kw)
-                    
+
                     # 找出未匹配的关键字
                     unmatched_keywords = [kw for kw in keywords if kw not in matched_keywords]
-                
+
                 else:  # 检索匹配
                     total = len(target_files)
                     matched_keywords = set()
@@ -595,27 +624,31 @@ class MatchWorker(QThread):
                     if not self.expand_search:  # 精确匹配模式
                         # 为每个关键字找到最佳匹配的文件
                         keyword_best_matches = {}  # 存储每个关键字的最佳匹配
-                        
+
                         for t in target_files:
                             t_name = os.path.basename(t)
                             t_name_no_ext = os.path.splitext(t_name)[0]
-                            
+
                             for kw in keywords:
-                                if kw in t_name_no_ext:
+                                # 带扩展名的关键字（如 12345-音频.mp3）按完整文件名
+                                # 匹配，可精确区分不同扩展名；不带扩展名的关键字
+                                # 沿用不含扩展名的匹配规则（保持原有行为）。
+                                match_target = t_name if '.' in kw else t_name_no_ext
+                                if kw in match_target:
                                     # 计算匹配度（精确匹配优先）
-                                    if t_name_no_ext == kw:
+                                    if match_target == kw:
                                         # 完全匹配，最高优先级
                                         match_score = 100
-                                    elif t_name_no_ext.startswith(kw + '-') or t_name_no_ext.startswith(kw + '_'):
+                                    elif match_target.startswith(kw + '-') or match_target.startswith(kw + '_'):
                                         # 以关键字开头，次高优先级
                                         match_score = 80
-                                    elif t_name_no_ext.endswith('-' + kw) or t_name_no_ext.endswith('_' + kw):
+                                    elif match_target.endswith('-' + kw) or match_target.endswith('_' + kw):
                                         # 以关键字结尾，中等优先级
                                         match_score = 60
                                     else:
                                         # 包含关键字，最低优先级
                                         match_score = 40
-                                    
+
                                     # 如果这个关键字还没有匹配，或者当前匹配度更高，则更新
                                     if kw not in keyword_best_matches or match_score > keyword_best_matches[kw][2]:
                                         keyword_best_matches[kw] = (t, t_name, match_score)
@@ -934,7 +967,7 @@ class FileSelector(QMainWindow):
         self.setWindowIcon(create_app_icon())
 
     def init_ui(self):
-        self.setWindowTitle("文件处理工具 v2.6")
+        self.setWindowTitle(f"文件处理工具 v{APP_VERSION}")
         self.setGeometry(300, 300, 1000, 800)
         central_widget = QWidget()
         self.setCentralWidget(central_widget)
@@ -972,9 +1005,9 @@ class FileSelector(QMainWindow):
         # 目录选择区域
         dir_group = QGroupBox("目录设置")
         dir_layout = QVBoxLayout()
-        # 目标目录选择
+        # 检索目录选择
         target_layout = QHBoxLayout()
-        target_layout.addWidget(QLabel("目标目录:"))
+        target_layout.addWidget(QLabel("检索目录:"))
         self.target_label = QLabel("未选择")
         self.target_label.setFrameStyle(QFrame.Shape.StyledPanel | QFrame.Shadow.Sunken)
         self.target_label.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
@@ -1018,7 +1051,7 @@ class FileSelector(QMainWindow):
         match_layout.addWidget(QLabel("匹配方式:"))
         self.match_method = QComboBox()
         self.match_method.addItems([
-            "根据源目录匹配提取",
+            "根据其他目录文件匹配提取",
             "根据文本匹配提取"
         ])
         self.match_method.currentIndexChanged.connect(self.on_match_method_changed)
@@ -1026,11 +1059,11 @@ class FileSelector(QMainWindow):
         # 匹配选项容器
         self.match_options_widget = QWidget()
         self.match_options_layout = QVBoxLayout(self.match_options_widget)
-        # 源目录匹配提取设置
+        # 匹配目录匹配提取设置
         self.dir_match_layout = QVBoxLayout()
-        # 源目录选择
+        # 匹配目录选择
         source_layout = QHBoxLayout()
-        source_layout.addWidget(QLabel("源目录:"))
+        source_layout.addWidget(QLabel("匹配目录:"))
         self.source_label = QLabel("未选择")
         self.source_label.setFrameStyle(QFrame.Shape.StyledPanel | QFrame.Shadow.Sunken)
         self.source_label.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
@@ -1063,16 +1096,16 @@ class FileSelector(QMainWindow):
         self.text_match_layout = QVBoxLayout()
         label = QLabel("检索文本（支持多行或分号分隔）:")
         self.text_match_layout.addWidget(label)
-        self.text_match_input = QTextEdit()
+        self.text_match_input = PasteTextEdit()
         self.text_match_input.setPlaceholderText("可输入多个文件名或关键字，支持换行或分号分隔")
         self.text_match_input.setFixedHeight(120)
         self.text_match_layout.addWidget(self.text_match_input)
-        
+
         # 添加文本匹配依据选项
         text_match_basis_row = QHBoxLayout()
         text_match_basis_row.addWidget(QLabel("匹配依据:"))
         self.text_match_basis_combo = QComboBox()
-        self.text_match_basis_combo.addItems(["完全匹配", "检索匹配"])
+        self.text_match_basis_combo.addItems(["检索匹配", "完全匹配"])
         self.text_match_basis_combo.currentIndexChanged.connect(self.on_text_match_basis_changed)
         text_match_basis_row.addWidget(self.text_match_basis_combo)
         self.text_match_layout.addLayout(text_match_basis_row)
@@ -1095,7 +1128,15 @@ class FileSelector(QMainWindow):
         self.expand_search_checkbox.hide()
         expand_search_row.itemAt(0).widget().hide()  # 隐藏标签
         expand_search_row.itemAt(2).widget().hide()  # 隐藏说明标签
-        
+
+        # 关键字实时统计（与匹配逻辑的解析规则一致）。
+        # 注意：必须添加在本布局的最后，否则 text_match_layout 的
+        # itemAt 索引偏移，on_text_match_basis_changed 中 itemAt(3)
+        # 会取到错误的布局导致异常。
+        self.keyword_count_label = QLabel("已识别 0 个关键字")
+        self.text_match_input.textChanged.connect(self._update_keyword_count)
+        self.text_match_layout.addWidget(self.keyword_count_label)
+
         # 添加所有布局到选项容器
         self.match_options_layout.addLayout(self.dir_match_layout)
         self.match_options_layout.addLayout(self.text_match_layout)
@@ -1109,9 +1150,9 @@ class FileSelector(QMainWindow):
         # 匹配文件统计和操作区域（移到左侧）
         op_group = QGroupBox("操作")
         op_layout = QVBoxLayout()
-        # 新增源/目标目录文件数量统计
-        self.source_file_count_label = QLabel("源目录文件数: 0")
-        self.target_file_count_label = QLabel("目标目录文件数: 0")
+        # 新增匹配/检索目录文件数量统计
+        self.source_file_count_label = QLabel("匹配目录文件数: 0")
+        self.target_file_count_label = QLabel("检索目录文件数: 0")
         op_layout.addWidget(self.source_file_count_label)
         op_layout.addWidget(self.target_file_count_label)
         self.match_count_label = QLabel("匹配文件总数: 0")
@@ -1468,6 +1509,7 @@ class FileSelector(QMainWindow):
 
     def generate_excel_file(self, files):
         """生成Excel文件"""
+        import pandas as pd  # 延迟导入（加载后命中模块缓存）
         try:
             # 如果已经有Excel文件且存在，先检查是否可用
             if self.excel_file_path and os.path.exists(self.excel_file_path):
@@ -1511,6 +1553,7 @@ class FileSelector(QMainWindow):
 
     def open_excel_file(self):
         """打开Excel文件"""
+        import pandas as pd  # 延迟导入（加载后命中模块缓存）
         # 如果没有Excel文件，先尝试生成
         if not self.excel_file_path or not os.path.exists(self.excel_file_path):
             if not self.rename_dir or not os.path.isdir(self.rename_dir):
@@ -1568,6 +1611,7 @@ class FileSelector(QMainWindow):
 
     def load_excel_data(self):
         """加载Excel数据"""
+        import pandas as pd  # 延迟导入（加载后命中模块缓存）
         if not self.excel_file_path or not os.path.exists(self.excel_file_path):
             return None
         
@@ -1735,6 +1779,7 @@ class FileSelector(QMainWindow):
 
     def process_excel_rename(self, df):
         """处理Excel重命名数据"""
+        import pandas as pd  # 延迟导入（加载后命中模块缓存）
         try:
             results = []
             files = list_visible_filenames(self.rename_dir)
@@ -2051,7 +2096,7 @@ class FileSelector(QMainWindow):
                     hide_all_widgets(item.layout())
         hide_all_widgets(self.match_options_layout)
         self.match_options_widget.hide()
-        if index == 0:  # 根据源目录匹配提取
+        if index == 0:  # 根据其他目录文件匹配提取
             self.match_options_widget.show()
             for i in range(self.dir_match_layout.count()):
                 item = self.dir_match_layout.itemAt(i)
@@ -2080,10 +2125,19 @@ class FileSelector(QMainWindow):
             # 检查文本匹配依据，决定是否显示扩大检索范围选项
             self.on_text_match_basis_changed(self.text_match_basis_combo.currentIndex())
 
+    def _update_keyword_count(self):
+        """实时统计检索文本中识别的关键字数量。
+
+        解析规则与 MatchWorker 保持一致：按换行或分号分隔，去除空项。
+        """
+        text = self.text_match_input.toPlainText()
+        keywords = [kw.strip() for kw in text.replace(';', '\n').split('\n') if kw.strip()]
+        self.keyword_count_label.setText(f"已识别 {len(keywords)} 个关键字")
+
     def on_text_match_basis_changed(self, index):
         """根据文本匹配依据的变化，更新扩大检索范围选项的可见性"""
-        # 只有当选择"检索匹配"时才显示扩大检索范围选项
-        if index == 1:  # 检索匹配
+        # 只有当选择"检索匹配"（默认项，index 0）时才显示扩大检索范围选项
+        if index == 0:  # 检索匹配
             self.expand_search_checkbox.show()
             # 显示标签和说明
             expand_search_row = self.text_match_layout.itemAt(3)  # 扩大检索范围选项的布局
@@ -2260,7 +2314,7 @@ class FileSelector(QMainWindow):
             
             # 源文件列或检索文本列
             if s:
-                # 源目录匹配模式：显示源文件名
+                # 匹配目录匹配模式：显示匹配目录文件名
                 source_item = QTableWidgetItem(s_name)
                 self.result_table.setItem(current_row, 1, source_item)
                 # 如果有匹配关键字，设置单元格部分文本颜色
@@ -2329,6 +2383,8 @@ class FileSelector(QMainWindow):
 
     def export_result_table_to_excel(self):
         """将右侧匹配结果表格导出为 Excel，仅包含源文件、目标文件列及红色未匹配样式"""
+        from openpyxl import Workbook  # 延迟导入（加载后命中模块缓存）
+        from openpyxl.styles import Font, Alignment
         if not self.result_table.rowCount():
             QMessageBox.warning(self, "警告", "没有可导出的结果，请先执行匹配")
             return
@@ -2494,8 +2550,8 @@ class FileSelector(QMainWindow):
 
     def on_file_counts_ready(self, source_count, target_count):
         """更新文件数量统计"""
-        self.source_file_count_label.setText(f"源目录文件数: {source_count}")
-        self.target_file_count_label.setText(f"目标目录文件数: {target_count}")
+        self.source_file_count_label.setText(f"匹配目录文件数: {source_count}")
+        self.target_file_count_label.setText(f"检索目录文件数: {target_count}")
 
     def cancel_operation(self):
         """取消当前操作"""
@@ -2550,13 +2606,46 @@ class FileSelector(QMainWindow):
         self.unmatched_keywords = unmatched_keywords
 
 if __name__ == "__main__":
+    # PyInstaller 内置启动页：exe 双击后立即显示（Python 解释器启动之前），
+    # 覆盖 onefile 解压阶段；此后通过 pyi_splash.update_text() 在启动页底部
+    # 实时显示依赖加载状态，主窗口显示完成后才关闭启动页。
+    try:
+        import pyi_splash
+    except Exception:
+        pyi_splash = None
+
+    def splash_update(text):
+        """更新启动页底部文字（源码运行时无启动页，直接跳过）。"""
+        if pyi_splash is not None:
+            pyi_splash.update_text(text)
+            import time
+            time.sleep(0.1)  # 给启动页留出重绘时间
+
     app = QApplication(sys.argv)
     app.setStyle("Fusion")  # 使用Fusion样式，看起来更现代
-    
+
+    # 重量级依赖延迟加载，并在启动页上分步显示加载状态。
+    # pandas / openpyxl 已从模块顶层移除此处加载（相关函数内部延迟导入）。
+    # 注意：update_text 必须在 QApplication 创建之后调用，避免 Tk 与 Qt
+    # 初始化时序冲突导致事件循环异常退出。
+    splash_update("正在加载数据处理组件（pandas）...")
+    import pandas
+    splash_update("正在加载表格组件（openpyxl）...")
+    import openpyxl
+    splash_update("正在初始化界面...")
+
     # 设置应用图标
     app_icon = create_app_icon()
     app.setWindowIcon(app_icon)
-    
+
     window = FileSelector()
     window.show()
+
+    # 关闭 PyInstaller 内置启动页（仅打包版存在该模块；源码运行自动跳过）。
+    # 注意：splash 基于 Tcl/Tk 实现，若在事件循环启动前直接调用 close()，
+    # 其销毁动作会向线程消息队列投递 WM_QUIT，导致 Qt 事件循环立即退出，
+    # 因此延迟到事件循环运行后（主窗口完整显示）再关闭。
+    if pyi_splash is not None:
+        QTimer.singleShot(300, pyi_splash.close)
+
     sys.exit(app.exec()) 
